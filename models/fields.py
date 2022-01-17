@@ -123,6 +123,26 @@ class SDFNetwork(nn.Module):
 
         self.activation = nn.Softplus(beta=100)
 
+    def flatten_linear_layers(self, dims=(256, 256)):
+        linear_layers_to_flatten = [
+            x for name, x in self.named_modules() if \
+                type(x) is torch.nn.Linear and \
+                x.weight.shape == dims and \
+                __class__.is_scene_specific(name)
+        ]
+
+        logging.info(f"{__class__.__name__}: flattening {len(linear_layers_to_flatten)} linear layers")
+
+        self.flattened_parameters_storage = torch.empty(
+            (len(linear_layers_to_flatten),) + dims).to(linear_layers_to_flatten[0].weight)
+
+        for layer, storage_slot in zip(linear_layers_to_flatten, self.flattened_parameters_storage):
+            with torch.no_grad():
+                storage_slot.copy_(layer.weight)
+            layer.register_parameter('weight', torch.nn.Parameter(storage_slot))
+
+        self.flattened_parameters_storage = self.flattened_parameters_storage.view(-1, 16, 16)
+
     def forward(self, inputs, scene_idx):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
@@ -188,18 +208,10 @@ class SDFNetwork(nn.Module):
     def parameters(self, which_layers='all'):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str):
-            name = name.split('.')
-
-            try:
-                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
-            except IndexError:
-                return False
-
         scenewise_parameters = \
-            [x for name, x in super().named_parameters() if is_scene_specific(name)]
+            [x for name, x in super().named_parameters() if __class__.is_scene_specific(name)]
         shared_parameters = \
-            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+            [x for name, x in super().named_parameters() if not __class__.is_scene_specific(name)]
 
         if which_layers == 'all':
             return scenewise_parameters + shared_parameters
@@ -209,6 +221,15 @@ class SDFNetwork(nn.Module):
             return shared_parameters
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
+
+    @staticmethod
+    def is_scene_specific(name: str):
+        name = name.split('.')
+
+        try:
+            return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+        except IndexError:
+            return False
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
@@ -288,6 +309,26 @@ class RenderingNetwork(nn.Module):
 
         self.relu = nn.ReLU()
 
+    def flatten_linear_layers(self, dims=(256, 256)):
+        linear_layers_to_flatten = [
+            x for name, x in self.named_modules() if \
+                type(x) is torch.nn.Linear and \
+                x.weight.shape == dims and \
+                __class__.is_scene_specific(name)
+        ]
+
+        logging.info(f"{__class__.__name__}: flattening {len(linear_layers_to_flatten)} linear layers")
+
+        self.flattened_parameters_storage = torch.empty(
+            (len(linear_layers_to_flatten),) + dims).to(linear_layers_to_flatten[0].weight)
+
+        for layer, storage_slot in zip(linear_layers_to_flatten, self.flattened_parameters_storage):
+            with torch.no_grad():
+                storage_slot.copy_(layer.weight)
+            layer.register_parameter('weight', torch.nn.Parameter(storage_slot))
+
+        self.flattened_parameters_storage = self.flattened_parameters_storage.view(-1, 16, 16)
+
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
@@ -344,18 +385,10 @@ class RenderingNetwork(nn.Module):
     def parameters(self, which_layers='all'):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str):
-            name = name.split('.')
-
-            try:
-                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
-            except IndexError:
-                return False
-
         scenewise_parameters = \
-            [x for name, x in super().named_parameters() if is_scene_specific(name)]
+            [x for name, x in super().named_parameters() if __class__.is_scene_specific(name)]
         shared_parameters = \
-            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+            [x for name, x in super().named_parameters() if not __class__.is_scene_specific(name)]
 
         if which_layers == 'all':
             return scenewise_parameters + shared_parameters
@@ -366,6 +399,14 @@ class RenderingNetwork(nn.Module):
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
+    @staticmethod
+    def is_scene_specific(name: str):
+        name = name.split('.')
+
+        try:
+            return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+        except IndexError:
+            return False
 
 # This implementation is borrowed from nerf-pytorch: https://github.com/yenchenlin/nerf-pytorch
 class NeRF(nn.Module):

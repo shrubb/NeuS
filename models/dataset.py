@@ -176,7 +176,10 @@ class Dataset(torch.utils.data.Dataset):
         self.intrinsics_all = [x.to(self.device) if x != [] else [] for x in self.intrinsics_all]
         self.intrinsics_all_inv = [torch.inverse(x) if x != [] else [] for x in self.intrinsics_all]
 
-        self.H, self.W = next(filter(lambda x: x != [], self.images)).shape[1:3]
+        try:
+            self.H, self.W = next(filter(lambda x: x != [], self.images)).shape[1:3]
+        except StopIteration:
+            self.H, self.W = 0, 0
         self.image_pixels = self.H * self.W
         if not all(
             images.shape[1:3] == (self.H, self.W) for images in self.images if images != []):

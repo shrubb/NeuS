@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
+import torch_batch_svd
 
 import random
 import pathlib
@@ -21,6 +22,7 @@ import logging
 import argparse
 from shutil import copyfile
 
+# torch.autograd.set_detect_anomaly(True)
 
 def psnr(color_fine, true_rgb, mask):
     assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
@@ -133,7 +135,7 @@ class Runner:
             [int(x) for x in self.conf.get_list('train.learning_rate_reduce_steps')]
         self.learning_rate_reduce_factor = self.conf.get_float('train.learning_rate_reduce_factor')
         self.scenewise_layers_optimizer_extra_args = \
-            dict(self.conf.get('train.scenewise_layers_optimizer_extra_args'))
+            dict(self.conf.get('train.scenewise_layers_optimizer_extra_args', default={}))
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
@@ -145,8 +147,11 @@ class Runner:
             del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
-        parts_to_train = \
+        self.parts_to_train = \
             self.conf.get_list('train.parts_to_train', default=[])
+        if self.parts_to_train == []:
+            self.parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
+
         load_optimizer = \
             self.conf.get_bool('train.load_optimizer', default=not self.finetune)
         parts_to_skip_loading = \
@@ -159,6 +164,8 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
+        self.nuclear_weight = self.conf.get_float('train.nuclear_weight', default=0.0)
+
         self.mode = mode
         self.model_list = []
         self.writer = None
@@ -170,16 +177,18 @@ class Runner:
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
 
+        if self.nuclear_weight != 0:
+            self.sdf_network.flatten_linear_layers()
+            self.color_network.flatten_linear_layers()
+            self.compute_nuclear_loss = self.get_nuclear_norm_loss()
+
         def get_optimizer(parts_to_train):
             """
             parts_to_train:
                 list of str
                 If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
             """
-            if parts_to_train == []:
-                parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
-            else:
-                logging.warning(f"Will optimize only these parts: {parts_to_train}")
+            logging.info(f"Will optimize only these parts: {parts_to_train}")
 
             parameter_group_names = ('shared', 'scenewise')
             parameter_groups = []
@@ -201,7 +210,8 @@ class Runner:
 
                 parameter_group_settings = {
                     'params': tensors_to_train,
-                    'base_learning_rate': self.base_learning_rate}
+                    'base_learning_rate': self.base_learning_rate,
+                    'group_name': which_layers}
 
                 if which_layers == 'scenewise':
                     parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
@@ -217,7 +227,7 @@ class Runner:
                                      **self.conf['model.neus_renderer'])
 
         if load_optimizer:
-            self.optimizer = get_optimizer(parts_to_train)
+            self.optimizer = get_optimizer(self.parts_to_train)
 
         if checkpoint_path is not None:
             self.load_checkpoint(checkpoint, parts_to_skip_loading, load_optimizer)
@@ -231,7 +241,7 @@ class Runner:
             self.nerf_outside.switch_to_finetuning()
 
         if not load_optimizer:
-            self.optimizer = get_optimizer(parts_to_train)
+            self.optimizer = get_optimizer(self.parts_to_train)
 
         # In case of finetuning
         self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes
@@ -239,6 +249,24 @@ class Runner:
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
             self.file_backup()
+
+    def get_nuclear_norm_loss(self):
+        nuclear_weight_tensors = []
+
+        if 'sdf' in self.parts_to_train:
+            nuclear_weight_tensors.append(self.sdf_network.flattened_parameters_storage)
+        if 'color' in self.parts_to_train:
+            nuclear_weight_tensors.append(self.color_network.flattened_parameters_storage)
+
+        def compute_nuclear_loss():
+            loss = 0.0
+
+            for tensor in nuclear_weight_tensors:
+                loss += torch_batch_svd.svd(tensor)[1].sum()
+
+            return loss
+
+        return compute_nuclear_loss
 
     def train(self):
         self.writer = SummaryWriter(log_dir=self.base_exp_dir)
@@ -297,6 +325,10 @@ class Runner:
                 mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
                 loss += mask_loss * self.mask_weight
 
+            if self.nuclear_weight > 0:
+                nuclear_loss = self.compute_nuclear_loss()
+                loss += nuclear_loss * self.nuclear_weight
+
             learning_rate = self.update_learning_rate() # the value is only needed for logging
             self.optimizer.zero_grad()
             loss.backward()
@@ -316,6 +348,9 @@ class Runner:
                 self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
                 self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
                 self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
+
+                if self.nuclear_weight > 0:
+                    self.writer.add_scalar('Loss/Nuclear norm', nuclear_loss, self.iter_step)
 
                 if self.iter_step % self.report_freq == 0:
                     print(self.base_exp_dir)
