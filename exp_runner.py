@@ -146,7 +146,7 @@ class Runner:
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
 
         if 'train.restart_from_iter' in self.conf:
-            del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
+            del self.conf['train']['restart_from_iter']
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
         parts_to_train = \
@@ -155,6 +155,11 @@ class Runner:
             self.conf.get_bool('train.load_optimizer', default=not self.finetune)
         parts_to_skip_loading = \
             self.conf.get_list('train.parts_to_skip_loading', default=[])
+
+        # For proper checkpoint auto-restarts
+        for key in 'load_optimizer', 'restart_from_iter', 'parts_to_skip_loading':
+            if f'train.{key}' in self.conf:
+                del self.conf['train'][key]
 
         if self.finetune:
             assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
@@ -394,7 +399,8 @@ class Runner:
                     mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
                     loss += mask_loss * self.mask_weight
 
-            learning_rate = self.update_learning_rate() # the value is only needed for logging
+            # These values are only needed for logging
+            learning_rate_shared, learning_rate_scenewise = self.update_learning_rate()
             self.optimizer.zero_grad()
             self.gradient_scaler.scale(loss).backward()
             self.average_shared_gradients_between_GPUs()
@@ -418,7 +424,8 @@ class Runner:
                     self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
                     self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
                     self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-                    self.writer.add_scalar('Statistics/Learning rate', learning_rate, self.iter_step)
+                    self.writer.add_scalar('Statistics/Learning rate', learning_rate_shared, self.iter_step)
+                    self.writer.add_scalar('Statistics/Learning rate (scenewise)', learning_rate_scenewise, self.iter_step)
                     self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
                     self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
                     self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
@@ -434,7 +441,9 @@ class Runner:
                         self.validate_images()
 
                     if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
-                        self.validate_mesh()
+                        self.validate_mesh(
+                            world_space=True,
+                            resolution=512 if self.iter_step == self.end_iter else 64)
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end == 0.0:
@@ -443,6 +452,9 @@ class Runner:
             return np.min([1.0, self.iter_step / self.anneal_end])
 
     def update_learning_rate(self):
+        # These return values are for logging only
+        lr_shared, lr_scenewise = np.nan, np.nan
+
         learning_rate_factor = 1.0
 
         if self.iter_step - self.restart_from_iter < self.warm_up_end:
@@ -458,9 +470,13 @@ class Runner:
 
         for g in self.optimizer.param_groups:
             g['lr'] = learning_rate_factor * g['base_learning_rate']
-            learning_rate_for_logging = g['lr']
 
-        return learning_rate_for_logging
+            if np.isnan(lr_shared) and 'SHARED' in g['group_name']:
+                lr_shared = g['lr']
+            if np.isnan(lr_scenewise) and 'SCENEWISE' in g['group_name']:
+                lr_scenewise = g['lr']
+
+        return lr_shared, lr_scenewise
 
     def file_backup(self):
         dir_lis = self.conf['general.recording']
@@ -514,6 +530,7 @@ class Runner:
             # Don't let overwrite custom keys
             param_groups_ckpt = \
                 {g['group_name']: g for g in checkpoint['optimizer']['param_groups']}
+
             for param_group in self.optimizer.param_groups:
                 for hyperparameter in 'base_learning_rate', 'weight_decay':
                     param_groups_ckpt[param_group['group_name']][hyperparameter] = \

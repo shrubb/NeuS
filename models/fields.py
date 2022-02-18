@@ -66,6 +66,7 @@ class LowRankMultiLinear(nn.Module):
                     layer, parameter_name, LowRankWeight(self, parameter_name, scene_idx))
 
         self.reset_parameters_()
+        self.finetuning = False
 
     def __getitem__(self, scene_idx):
         return self.linear_layers[scene_idx]
@@ -85,6 +86,41 @@ class LowRankMultiLinear(nn.Module):
         # Initialize linear combination coefficients
         nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
 
+    def switch_to_finetuning(self, algorithm='pick'):
+        """
+        Like `SDFNetwork.switch_to_finetuning()`, but just for this layer.
+
+        algorithm
+            str
+            One of:
+            - pick (take the 0th scene's linear combination coefficients)
+            - average (average coefficients over all scenes)
+        """
+        if algorithm == 'pick':
+            new_combination_coeffs = self.combination_coeffs[:1]
+        elif algorithm == 'average':
+            new_combination_coeffs = self.combination_coeffs.mean(0, keepdim=True)
+        else:
+            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+        self.combination_coeffs = nn.Parameter(new_combination_coeffs)
+        self.linear_layers = self.linear_layers[:1]
+        self.finetuning = True
+
+    def parameters(self, which_layers='all', scene_idx=None):
+        """which_layers: 'all'/'scenewise'/'shared'
+        """
+        if self.finetuning:
+            assert scene_idx is None or scene_idx == 0 and len(self.combination_coeffs == 1)
+
+        if which_layers == 'all':
+            return super().parameters()
+        elif which_layers == 'scenewise':
+            return [self.combination_coeffs] if self.finetuning else []
+        elif which_layers == 'shared':
+            return list(self.basis_weights.values()) if self.finetuning else super().parameters()
+        else:
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
@@ -216,7 +252,13 @@ class SDFNetwork(nn.Module):
 
         self.activation = nn.Softplus(beta=100)
 
-        self.scenewise_lowrank = scenewise_core_rank is not None
+        self.is_lowrank = scenewise_core_rank is not None
+
+        # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
+        if len(list(super().parameters())) != len(list(self.parameters('all'))):
+            raise NotImplementedError(
+                "There's an extra parameter that's not yet handled by `self.parameters()`. " \
+                "Please address this.")
 
     def forward(self, inputs, scene_idx):
         inputs = inputs * self.scale
@@ -274,57 +316,57 @@ class SDFNetwork(nn.Module):
             - pick (take the 0th scene's 'subnetwork')
             - average (average weight tensors over all scenes)
         """
-        if self.scenewise_lowrank:
-            raise NotImplementedError("switch_to_finetuning()")
+        for i in range(self.num_layers):
+            layer_type = type(self.linear_layers[i])
 
-        if algorithm == 'pick':
-            for i in range(self.num_layers):
-                if type(self.linear_layers[i]) is nn.ModuleList:
-                    self.linear_layers[i] = nn.ModuleList([self.linear_layers[i][0]])
-        elif algorithm == 'average':
-            for i in range(self.num_layers):
-                if type(self.linear_layers[i]) is nn.ModuleList:
+            if layer_type is nn.ModuleList:
+                if algorithm == 'pick':
+                    new_layer = self.linear_layers[i][0]
+                elif algorithm == 'average':
                     new_layer = self.linear_layers[i][0]
                     for param_name, _ in new_layer.named_parameters():
                         averaged_param = torch.stack(
                             [m.get_parameter(param_name) for m in self.linear_layers[i]]).mean(0)
                         new_layer.get_parameter(param_name).copy_(averaged_param)
+                else:
+                    raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-                    self.linear_layers[i] = nn.ModuleList([new_layer])
-        else:
-            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+            elif layer_type is LowRankMultiLinear:
+                self.linear_layers[i].switch_to_finetuning(algorithm)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str, scene_idx: int = None):
-            """
-            Is layer with this name both
-                1. scene-specific;
-                2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
-            """
-            if self.scenewise_lowrank:
-                return False
-
-            name = name.split('.')
-
-            try:
-                retval = name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
-                if retval and scene_idx is not None:
-                    retval &= int(name[2]) == scene_idx
-                return retval
-            except IndexError:
-                return False
-
         if which_layers == 'all':
             assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
             return list(super().parameters())
         elif which_layers == 'scenewise':
-            return \
-                [x for name, x in super().named_parameters() if is_scene_specific(name, scene_idx)]
+            retval = []
+            for module in self.linear_layers:
+                if type(module) is nn.Linear:
+                    pass # Only shared layers can be `Linear`, so don't add
+                elif type(module) is nn.ModuleList:
+                    module_to_add = module if scene_idx is None else module[scene_idx]
+                    retval += list((module_to_add).parameters())
+                elif type(module) is LowRankMultiLinear:
+                    # Let `LowRankMultiLinear` decide
+                    retval += list(module.parameters(which_layers, scene_idx))
+                else:
+                    raise RuntimeError(f"Unexpected module type: {module}")
+            return retval
         elif which_layers == 'shared':
-            return \
-                [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+            retval = []
+            for module in self.linear_layers:
+                if type(module) is nn.Linear:
+                    retval += list(module.parameters())
+                elif type(module) is nn.ModuleList:
+                    pass # Only scenewise layers can be `ModuleList`, so don't add
+                elif type(module) is LowRankMultiLinear:
+                    # Let `LowRankMultiLinear` decide
+                    retval += list(module.parameters(which_layers, scene_idx))
+                else:
+                    raise RuntimeError(f"Unexpected module type: {module}")
+            return retval
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
@@ -406,7 +448,13 @@ class RenderingNetwork(nn.Module):
 
         self.relu = nn.ReLU()
 
-        self.scenewise_lowrank = scenewise_core_rank is not None
+        self.is_lowrank = scenewise_core_rank is not None
+
+        # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
+        if len(list(super().parameters())) != len(list(self.parameters('all'))):
+            raise NotImplementedError(
+                "There's an extra parameter that's not yet handled by `self.parameters()`. " \
+                "Please address this.")
 
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
         if self.embedview_fn is not None:
@@ -455,61 +503,62 @@ class RenderingNetwork(nn.Module):
             - pick (take the 0th scene's 'subnetwork')
             - average (average weight tensors over all scenes)
         """
-        if algorithm == 'pick':
-            for i in range(self.num_layers):
-                if type(self.linear_layers[i]) is not nn.Linear: # layer is scene-specific
-                    layer_to_pick = self.linear_layers[i][0]
+        for i in range(self.num_layers):
+            layer_type = type(self.linear_layers[i])
 
-                    # If we wanted to compute weights and revert to a regular `Linear` layer:
-                    # if type(self.linear_layers[i]) is LowRankMultiLinear:
-                    #     for p_name in 'weight', 'bias':
-                    #         nn.utils.parametrize.remove_parametrizations(layer_to_pick, p_name)
-
-                    self.linear_layers[i] = nn.ModuleList([layer_to_pick])
-        elif algorithm == 'average':
-            for i in range(self.num_layers):
-                if type(self.linear_layers[i]) is nn.ModuleList:
+            if layer_type is nn.ModuleList:
+                if algorithm == 'pick':
+                    new_layer = self.linear_layers[i][0]
+                elif algorithm == 'average':
                     new_layer = self.linear_layers[i][0]
                     for param_name, _ in new_layer.named_parameters():
                         averaged_param = torch.stack(
                             [m.get_parameter(param_name) for m in self.linear_layers[i]]).mean(0)
                         new_layer.get_parameter(param_name).copy_(averaged_param)
+                else:
+                    raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-                    self.linear_layers[i] = nn.ModuleList([new_layer])
-        else:
-            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+            elif layer_type is LowRankMultiLinear:
+                self.linear_layers[i].switch_to_finetuning(algorithm)
+
+                # If we wanted to compute weights and revert to a regular `Linear` layer:
+                # if type(self.linear_layers[i]) is LowRankMultiLinear:
+                #     for p_name in 'weight', 'bias':
+                #         nn.utils.parametrize.remove_parametrizations(layer_to_pick, p_name)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str, scene_idx: int = None):
-            """
-            Is layer with this name both
-                1. scene-specific;
-                2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
-            """
-            if self.scenewise_lowrank:
-                return False
-
-            name = name.split('.')
-
-            try:
-                retval = name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
-                if retval and scene_idx is not None:
-                    retval &= int(name[2]) == scene_idx
-                return retval
-            except IndexError:
-                return False
-
         if which_layers == 'all':
             assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
             return list(super().parameters())
         elif which_layers == 'scenewise':
-            return \
-                [x for name, x in super().named_parameters() if is_scene_specific(name, scene_idx)]
+            retval = []
+            for module in self.linear_layers:
+                if type(module) is nn.Linear:
+                    pass # Only shared layers can be `Linear`, so don't add
+                elif type(module) is nn.ModuleList:
+                    module_to_add = module if scene_idx is None else module[scene_idx]
+                    retval += list((module_to_add).parameters())
+                elif type(module) is LowRankMultiLinear:
+                    # Let `LowRankMultiLinear` decide
+                    retval += list(module.parameters(which_layers, scene_idx))
+                else:
+                    raise RuntimeError(f"Unexpected module type: {module}")
+            return retval
         elif which_layers == 'shared':
-            return \
-                [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+            retval = []
+            for module in self.linear_layers:
+                if type(module) is nn.Linear:
+                    retval += list(module.parameters())
+                elif type(module) is nn.ModuleList:
+                    pass # Only scenewise layers can be `ModuleList`, so don't add
+                elif type(module) is LowRankMultiLinear:
+                    # Let `LowRankMultiLinear` decide
+                    retval += list(module.parameters(which_layers, scene_idx))
+                else:
+                    raise RuntimeError(f"Unexpected module type: {module}")
+            return retval
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
