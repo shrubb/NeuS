@@ -468,6 +468,8 @@ class RenderingNetwork(nn.Module):
             rendering_input = torch.cat([points, normals, feature_vectors], dim=-1)
         elif self.mode == 'no_normal':
             rendering_input = torch.cat([points, view_dirs, feature_vectors], dim=-1)
+        elif self.mode == 'points_grads_only':
+            rendering_input = torch.cat([points, normals], dim=-1)
 
         x = rendering_input
 
