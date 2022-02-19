@@ -208,7 +208,8 @@ class NeuSRenderer:
                     background_alpha=None,
                     background_sampled_color=None,
                     background_rgb=None,
-                    cos_anneal_ratio=0.0):
+                    cos_anneal_ratio=0.0,
+                    compute_losses=False):
         batch_size, n_samples = z_vals.shape
 
         # Section length
@@ -255,7 +256,6 @@ class NeuSRenderer:
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
-        relax_inside_sphere = (pts_norm < 1.2).float().detach()
 
         # Render with background
         if background_alpha is not None:
@@ -273,12 +273,7 @@ class NeuSRenderer:
         if background_rgb is not None:    # Fixed background, usually black
             color = color + background_rgb * (1.0 - weights_sum)
 
-        # Eikonal loss
-        gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, n_samples, 3), ord=2,
-                                            dim=-1) - 1.0) ** 2
-        gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
-
-        return {
+        retval = {
             'color': color,
             'sdf': sdf,
             'dists': dists,
@@ -287,13 +282,18 @@ class NeuSRenderer:
             'mid_z_vals': mid_z_vals,
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
-            'gradient_error': gradient_error,
-            'inside_sphere': inside_sphere
+            'inside_sphere': inside_sphere,
         }
+
+        if compute_losses:
+            retval['relax_inside_sphere'] = (pts_norm < 1.2).float().detach()
+
+        return retval
 
     def render(self,
         rays_o, rays_d, near, far, scene_idx,
-        perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+        perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0,
+        compute_losses=False):
 
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
@@ -372,7 +372,8 @@ class NeuSRenderer:
                                     background_rgb=background_rgb,
                                     background_alpha=background_alpha,
                                     background_sampled_color=background_sampled_color,
-                                    cos_anneal_ratio=cos_anneal_ratio)
+                                    cos_anneal_ratio=cos_anneal_ratio,
+                                    compute_losses=compute_losses)
 
         color_fine = ret_fine['color']
         weights = ret_fine['weights']
@@ -380,7 +381,7 @@ class NeuSRenderer:
         gradients = ret_fine['gradients']
         s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
 
-        return {
+        retval = {
             'color_fine': color_fine,
             's_val': s_val,
             'cdf_fine': ret_fine['cdf'],
@@ -388,9 +389,13 @@ class NeuSRenderer:
             'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
             'gradients': gradients,
             'weights': weights,
-            'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
+            'inside_sphere': ret_fine['inside_sphere'],
         }
+
+        if compute_losses:
+            retval['relax_inside_sphere'] = ret_fine['relax_inside_sphere']
+
+        return retval
 
     def extract_geometry(self, scene_idx, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,

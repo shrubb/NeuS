@@ -169,6 +169,8 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
+        # self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight')
+
         self.mode = args.mode
         self.model_list = []
         self.writer = None
@@ -368,16 +370,18 @@ class Runner:
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
                 render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
                                                   background_rgb=background_rgb,
-                                                  cos_anneal_ratio=self.get_cos_anneal_ratio())
+                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                                  compute_losses=True)
 
                 color_fine = render_out['color_fine']
                 s_val = render_out['s_val']
                 cdf_fine = render_out['cdf_fine']
-                gradient_error = render_out['gradient_error']
+                gradients = render_out['gradients']
+                relax_inside_sphere = render_out['relax_inside_sphere']
                 weight_max = render_out['weight_max']
                 weight_sum = render_out['weight_sum']
 
-                # Loss
+                # Image loss
                 color_error = color_fine - true_rgb
                 if self.mask_weight > 0.0:
                     color_error *= mask
@@ -390,14 +394,20 @@ class Runner:
 
                 psnr_train = psnr(color_fine, true_rgb, mask)
 
-                eikonal_loss = gradient_error
-
+                # Eikonal loss
+                gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
+                eikonal_loss = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
                 loss = color_fine_loss + \
                        eikonal_loss * self.igr_weight
 
+                # Mask loss
                 if self.mask_weight > 0.0:
                     mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
                     loss += mask_loss * self.mask_weight
+
+                # Radiance gradient loss
+                # if self.radiance_grad_weight > 0:
+                #     radiance_grad_loss =
 
             # These values are only needed for logging
             learning_rate_shared, learning_rate_scenewise = self.update_learning_rate()
@@ -599,7 +609,8 @@ class Runner:
                                                       far_batch,
                                                       val_scene_idx,
                                                       cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                      background_rgb=background_rgb)
+                                                      background_rgb=background_rgb,
+                                                      compute_losses=False)
 
                     def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
@@ -672,7 +683,8 @@ class Runner:
                                               far_batch,
                                               scene_idx,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                              background_rgb=background_rgb)
+                                              background_rgb=background_rgb,
+                                              compute_losses=False)
 
             rgb_all.append(render_out['color_fine'].detach().cpu().numpy())
 
