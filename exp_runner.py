@@ -155,6 +155,9 @@ class Runner:
             self.conf.get_bool('train.load_optimizer', default=not self.finetune)
         parts_to_skip_loading = \
             self.conf.get_list('train.parts_to_skip_loading', default=[])
+        # 'pick' or 'average'
+        finetuning_init_algorithm = \
+            self.conf.get_string('train.finetuning_init_algorithm', default='average')
 
         # For proper checkpoint auto-restarts
         for key in 'load_optimizer', 'restart_from_iter', 'parts_to_skip_loading':
@@ -301,11 +304,10 @@ class Runner:
         self.iter_step = self.restart_from_iter
 
         if self.finetune:
-            ALGORITHM = 'average'
             with torch.no_grad():
-                self.sdf_network.switch_to_finetuning(ALGORITHM)
-                self.color_network.switch_to_finetuning(ALGORITHM)
-                self.nerf_outside.switch_to_finetuning(ALGORITHM)
+                self.sdf_network.switch_to_finetuning(finetuning_init_algorithm)
+                self.color_network.switch_to_finetuning(finetuning_init_algorithm)
+                self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm)
 
         if not load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)
