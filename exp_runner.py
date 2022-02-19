@@ -435,7 +435,7 @@ class Runner:
                     if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                         self.save_checkpoint()
 
-                    if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
+                    if self.iter_step % self.val_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                         self.validate_images()
 
                     if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
@@ -712,13 +712,13 @@ class Runner:
 
         logging.info('End')
 
-    def interpolate_view(self, scene_idx, img_idx_0, img_idx_1):
+    def interpolate_view(self, scene_idx, img_idx_0, img_idx_1, n_frames=30):
+        assert n_frames > 1
         images = []
-        n_frames = 30
         for i in tqdm(range(n_frames)):
             image, normals = self.render_novel_image(
                 scene_idx, img_idx_0, img_idx_1,
-                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2)
+                np.sin(((i / (n_frames - 1)) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2)
             video_frame = np.concatenate([image, normals], axis=0)
 
             images.append(video_frame)
@@ -765,7 +765,7 @@ if __name__ == '__main__':
     args.num_gpus = args.world_size = int(os.environ.get('WORLD_SIZE', 1))
 
     if args.rank > 0 and args.mode != 'train':
-        logger.warning(f"`--mode` != 'train', shutting all processes but one")
+        logger.warning(f"`--mode` != 'train', shutting down all processes but one")
 
     # Multi-GPU training
     torch.cuda.set_device(args.local_rank)
