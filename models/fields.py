@@ -687,8 +687,8 @@ class SingleVarianceNetwork(nn.Module):
         super(SingleVarianceNetwork, self).__init__()
         self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
 
-    def forward(self, x):
-        return torch.ones([len(x), 1], device=x.device) * torch.exp(self.variance * 10.0)
+    def forward(self, size, device):
+        return torch.ones([size, 1], device=device) * torch.exp(self.variance * 10.0)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'

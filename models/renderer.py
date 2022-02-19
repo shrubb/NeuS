@@ -101,7 +101,7 @@ class NeuSRenderer:
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([
             dists,
-            torch.Tensor([sample_dist]).to(dists).expand(dists[..., :1].shape),
+            torch.empty(1, device=dists.device).fill_(sample_dist).expand(dists[..., :1].shape),
         ], -1)
         mid_z_vals = z_vals + dists * 0.5
 
@@ -215,7 +215,7 @@ class NeuSRenderer:
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat(
-            [dists, torch.Tensor([sample_dist]).to(dists).expand(dists[..., :1].shape)], -1)
+            [dists, torch.empty(1, device=dists.device).fill_(sample_dist).expand(dists[..., :1].shape)], -1)
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
@@ -232,7 +232,7 @@ class NeuSRenderer:
         gradients = sdf_network.gradient(pts, scene_idx).squeeze()
         sampled_color = color_network(pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
-        inv_s = deviation_network(torch.zeros([1, 3]).to(sdf))[:, :1].clip(1e-6, 1e6)           # Single parameter
+        inv_s = deviation_network(1, sdf.device).clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
 
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
