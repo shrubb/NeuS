@@ -168,8 +168,8 @@ class Runner:
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
-        self.mask_weight = self.conf.get_float('train.mask_weight')
-        # self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight')
+        self.mask_weight = self.conf.get_float('train.mask_weight', default=0)
+        self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0)
 
         self.mode = args.mode
         self.model_list = []
@@ -371,15 +371,16 @@ class Runner:
                 render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
                                                   background_rgb=background_rgb,
                                                   cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                  compute_losses=True)
+                                                  compute_losses=self.radiance_grad_weight > 0)
 
                 color_fine = render_out['color_fine']
                 s_val = render_out['s_val']
                 cdf_fine = render_out['cdf_fine']
                 gradients = render_out['gradients']
-                relax_inside_sphere = render_out['relax_inside_sphere']
                 weight_max = render_out['weight_max']
                 weight_sum = render_out['weight_sum']
+
+                loss = 0
 
                 # Image loss
                 color_error = color_fine - true_rgb
@@ -391,14 +392,23 @@ class Runner:
                     color_fine_loss /= mask_sum
                 else:
                     color_fine_loss /= color_error.numel()
+                loss += color_fine_loss
 
                 psnr_train = psnr(color_fine, true_rgb, mask)
 
                 # Eikonal loss
                 gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
-                eikonal_loss = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
-                loss = color_fine_loss + \
-                       eikonal_loss * self.igr_weight
+                total_eikonal_loss = (relax_inside_sphere * gradient_error).sum()
+                total_eikonal_points = relax_inside_sphere.sum()
+
+                if self.radiance_grad_weight > 0:
+                    gradients_eikonal = render_out['gradients_eikonal']
+                    gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
+                    total_eikonal_loss += gradient_error.sum()
+                    total_eikonal_points += eikonal_loss_random.numel()
+
+                eikonal_loss = total_eikonal_loss / (total_eikonal_points + 1e-5)
+                loss += eikonal_loss * self.igr_weight
 
                 # Mask loss
                 if self.mask_weight > 0.0:

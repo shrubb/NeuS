@@ -229,8 +229,9 @@ class NeuSRenderer:
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
-        gradients = sdf_network.gradient(pts, scene_idx).squeeze()
-        sampled_color = color_network(pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
+        gradients, _ = sdf_network.gradient(pts, scene_idx)
+        sampled_color = color_network(
+            pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(1, sdf.device).clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -256,6 +257,7 @@ class NeuSRenderer:
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
+        relax_inside_sphere = (pts_norm < 1.2).float().detach()
 
         # Render with background
         if background_alpha is not None:
@@ -283,10 +285,26 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'inside_sphere': inside_sphere,
+            'relax_inside_sphere': relax_inside_sphere
         }
 
         if compute_losses:
-            retval['relax_inside_sphere'] = (pts_norm < 1.2).float().detach()
+            def random_sample_in_ball(num_points, r=1.0, device=None):
+                # Generate points uniformly in a ball
+                # https://stats.stackexchange.com/a/30622
+                retval = torch.randn((num_points, 3), device=device)
+                retval /= retval.norm(2, dim=-1, keepdim=True).clip(1e-5)
+                retval *= r * (torch.rand((num_points, 1), device=device) ** (1/3))
+                return retval
+
+            loss_pts = random_sample_in_ball(batch_size * n_samples // 8, device=pts.device)
+            loss_pts_sdf_grad, loss_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
+
+            retval['gradients_eikonal'] = loss_pts_sdf_grad
+            # if color_network.mode not in ('no_view_dir', 'points_grads_only'):
+            #     raise NotImplementedError("Eikonal loss + color loss")
+            # loss_pts_color = color_network(
+            #     loss_pts, loss_pts_sdf_grad.squeeze(), loss_pts, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
         return retval
 
@@ -390,10 +408,11 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'inside_sphere': ret_fine['inside_sphere'],
+            'relax_inside_sphere': ret_fine['relax_inside_sphere'],
         }
 
         if compute_losses:
-            retval['relax_inside_sphere'] = ret_fine['relax_inside_sphere']
+            retval['gradients_eikonal'] = ret_fine['gradients_eikonal']
 
         return retval
 
