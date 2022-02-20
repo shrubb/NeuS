@@ -257,7 +257,6 @@ class NeuSRenderer:
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
-        relax_inside_sphere = (pts_norm < 1.2).float().detach()
 
         # Render with background
         if background_alpha is not None:
@@ -285,10 +284,17 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'inside_sphere': inside_sphere,
-            'relax_inside_sphere': relax_inside_sphere
         }
 
         if compute_losses:
+            # Generate points:
+            # some totally random points + some random points near the surface + some ray points
+            NUM_RANDOM_PTS_PER_RAY = 6
+            NUM_RANDOM_SURFACE_PTS_PER_RAY = 6
+            NOISE_AMPLITUDE = 0.055
+            NUM_RANDOM_RAY_POINTS_PER_RAY = 6
+
+            # Uniformly sampled points
             def random_sample_in_ball(num_points, r=1.0, device=None):
                 # Generate points uniformly in a ball
                 # https://stats.stackexchange.com/a/30622
@@ -297,17 +303,33 @@ class NeuSRenderer:
                 retval *= r * (torch.rand((num_points, 1), device=device) ** (1/3))
                 return retval
 
-            loss_pts = random_sample_in_ball(batch_size * n_samples // 8, device=pts.device) # K, 3
+            n_random_points = batch_size * NUM_RANDOM_PTS_PER_RAY
+            random_pts = random_sample_in_ball(n_random_points, device=pts.device)
+
+            # Surface points
+            with torch.no_grad():
+                weights_inside = weights[:, :n_samples, None] # batch_size, n_samples, 1
+                surface_pts = (pts.reshape(batch_size, n_samples, 3) * weights_inside).sum(1) / \
+                    weights_inside.sum(1).clip(1e-5) # batch_size, 3
+            surface_pts = surface_pts.repeat(NUM_RANDOM_SURFACE_PTS_PER_RAY, 1)
+            surface_pts += (torch.rand_like(surface_pts) - 0.5) * (NOISE_AMPLITUDE * 2)
+
+            # Ray points
+            ray_pts_indices = torch.randperm(
+                len(pts), device=pts.device)[:batch_size * NUM_RANDOM_RAY_POINTS_PER_RAY]
+            ray_pts = pts[ray_pts_indices]
+
+            loss_pts = torch.cat([random_pts, surface_pts, ray_pts], dim=0) # M, 3
+            retval['relax_inside_sphere'] = (loss_pts.norm(2, dim=-1) < 1.2).float().detach()
+
             loss_pts_sdf_grad, loss_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
+            retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
-            retval['gradients_eikonal'] = loss_pts_sdf_grad # K, 3
-
-            example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # K, 3
+            example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
             loss_pts_radiance_grad = color_network.gradient(
                 loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
-                loss_feature_vector.detach(), scene_idx) # 3, K, 3
-
-            retval['gradients_radiance'] = loss_pts_radiance_grad
+                loss_feature_vector.detach(), scene_idx)
+            retval['gradients_radiance'] = loss_pts_radiance_grad # 3, M, 3
 
         return retval
 
@@ -411,10 +433,10 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'inside_sphere': ret_fine['inside_sphere'],
-            'relax_inside_sphere': ret_fine['relax_inside_sphere'],
         }
 
         if compute_losses:
+            retval['relax_inside_sphere'] = ret_fine['relax_inside_sphere']
             retval['gradients_eikonal'] = ret_fine['gradients_eikonal']
             retval['gradients_radiance'] = ret_fine['gradients_radiance']
 

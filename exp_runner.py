@@ -381,8 +381,6 @@ class Runner:
                 gradients = render_out['gradients']
                 weight_max = render_out['weight_max']
                 weight_sum = render_out['weight_sum']
-                # boolean mask, 1 if point is inside 1-sphere
-                relax_inside_sphere = render_out['relax_inside_sphere']
 
                 loss = 0
 
@@ -400,26 +398,29 @@ class Runner:
 
                 psnr_train = psnr(color_fine, true_rgb, mask)
 
-                # Eikonal loss
-                gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
-                total_eikonal_loss = (relax_inside_sphere * gradient_error).sum()
-                total_eikonal_points = relax_inside_sphere.sum()
-
-                # For now, `radiance_grad_weight > 0` implies computing eikonal
-                # loss at extra random points
-                if self.radiance_grad_weight > 0:
-                    gradients_eikonal = render_out['gradients_eikonal']
-                    gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
-                    total_eikonal_loss += gradient_error.sum()
-                    total_eikonal_points += gradient_error.numel()
-
-                eikonal_loss = total_eikonal_loss / (total_eikonal_points + 1e-5)
-                loss += eikonal_loss * self.igr_weight
-
                 # Mask loss
                 if self.mask_weight > 0.0:
                     mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
                     loss += mask_loss * self.mask_weight
+
+                # Eikonal loss
+                if self.igr_weight > 0 and self.radiance_grad_weight == 0:
+                    raise ValueError(
+                        "For now, `radiance_grad_weight` must be > 0 for " \
+                        "eikonal loss to get computed")
+
+                # For now, `radiance_grad_weight > 0` implies computing eikonal
+                # loss at extra random points
+                if self.radiance_grad_weight > 0:
+                    # boolean mask, 1 if point is inside 1-sphere
+                    relax_inside_sphere = render_out['relax_inside_sphere']
+
+                    gradients_eikonal = render_out['gradients_eikonal']
+                    gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
+                    eikonal_loss = \
+                        (relax_inside_sphere * gradient_error).sum() / \
+                        (relax_inside_sphere.sum() + 1e-5)
+                    loss += eikonal_loss * self.igr_weight
 
                 # Radiance gradient loss
                 if self.radiance_grad_weight > 0:
@@ -456,8 +457,8 @@ class Runner:
                 if self.rank == 0:
                     self.writer.add_scalar('Loss/Total', loss, self.iter_step)
                     self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
-                    self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
                     if self.radiance_grad_weight > 0:
+                        self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
                         self.writer.add_scalar('Loss/<dRGB,dSDF>', radiance_grad_loss, self.iter_step)
                     self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
                     self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
