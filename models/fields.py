@@ -294,7 +294,8 @@ class SDFNetwork(nn.Module):
     def gradient(self, x, scene_idx):
         with torch.enable_grad():
             x.requires_grad_(True)
-            y = self.sdf(x, scene_idx)
+            forward = self(x, scene_idx)
+            y, feature_vector = forward[:, :1], forward[:, 1:]
             d_output = torch.ones_like(y, requires_grad=False, device=y.device)
             gradients = torch.autograd.grad(
                 outputs=y,
@@ -303,7 +304,7 @@ class SDFNetwork(nn.Module):
                 create_graph=True,
                 retain_graph=True,
                 only_inputs=True)[0]
-            return gradients.unsqueeze(1)
+            return gradients, feature_vector
 
     def switch_to_finetuning(self, algorithm='pick'):
         """
