@@ -379,6 +379,8 @@ class Runner:
                 gradients = render_out['gradients']
                 weight_max = render_out['weight_max']
                 weight_sum = render_out['weight_sum']
+                # boolean mask, 1 if point is inside 1-sphere
+                relax_inside_sphere = render_out['relax_inside_sphere']
 
                 loss = 0
 
@@ -401,11 +403,13 @@ class Runner:
                 total_eikonal_loss = (relax_inside_sphere * gradient_error).sum()
                 total_eikonal_points = relax_inside_sphere.sum()
 
+                # For now, `radiance_grad_weight > 0` implies computing eikonal
+                # loss at extra random points
                 if self.radiance_grad_weight > 0:
                     gradients_eikonal = render_out['gradients_eikonal']
                     gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
                     total_eikonal_loss += gradient_error.sum()
-                    total_eikonal_points += eikonal_loss_random.numel()
+                    total_eikonal_points += gradient_error.numel()
 
                 eikonal_loss = total_eikonal_loss / (total_eikonal_points + 1e-5)
                 loss += eikonal_loss * self.igr_weight
@@ -416,8 +420,17 @@ class Runner:
                     loss += mask_loss * self.mask_weight
 
                 # Radiance gradient loss
-                # if self.radiance_grad_weight > 0:
-                #     radiance_grad_loss =
+                if self.radiance_grad_weight > 0:
+                    # dim 0: gradient of r/g/b
+                    # dim 1: point number
+                    # dim 2: gradient over x/y/z
+                    gradients_radiance = render_out['gradients_radiance'] # 3, K, 3
+                    gradients_eikonal_ = gradients_eikonal.detach()[None] # 1, K, 3
+
+                    # We want these gradients to be orthogonal, so force dot product to zero
+                    grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K
+                    radiance_grad_loss = (grads_dot_product ** 2).mean()
+                    loss += radiance_grad_loss * self.radiance_grad_weight
 
             # These values are only needed for logging
             learning_rate_shared, learning_rate_scenewise = self.update_learning_rate()
@@ -442,6 +455,8 @@ class Runner:
                     self.writer.add_scalar('Loss/Total', loss, self.iter_step)
                     self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
                     self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
+                    if self.radiance_grad_weight > 0:
+                        self.writer.add_scalar('Loss/<dRGB,dSDF>', radiance_grad_loss, self.iter_step)
                     self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
                     self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
                     self.writer.add_scalar('Statistics/Learning rate', learning_rate_shared, self.iter_step)

@@ -495,6 +495,30 @@ class RenderingNetwork(nn.Module):
             x = torch.sigmoid(x)
         return x
 
+    def gradient(self, points, normals, view_dirs, feature_vectors, scene_idx):
+        with torch.enable_grad():
+            points.requires_grad_(True)
+            radiance = self(points, normals, view_dirs, feature_vectors, scene_idx)
+
+            gradients = []
+            for i in range(3): # R,G,B
+                d_output = torch.zeros_like(radiance, requires_grad=False, device=radiance.device)
+                d_output[..., i] = 1
+
+                gradients.append(
+                    torch.autograd.grad(
+                        outputs=radiance,
+                        inputs=points,
+                        grad_outputs=d_output,
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True)[0])
+
+            # dim 0: gradient of r/g/b
+            # dim 1: point number
+            # dim 2: gradient over x/y/z
+            return torch.stack(gradients) # 3, K, 3
+
     def switch_to_finetuning(self, algorithm='pick'):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',

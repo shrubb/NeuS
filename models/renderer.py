@@ -297,14 +297,17 @@ class NeuSRenderer:
                 retval *= r * (torch.rand((num_points, 1), device=device) ** (1/3))
                 return retval
 
-            loss_pts = random_sample_in_ball(batch_size * n_samples // 8, device=pts.device)
+            loss_pts = random_sample_in_ball(batch_size * n_samples // 8, device=pts.device) # K, 3
             loss_pts_sdf_grad, loss_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
 
-            retval['gradients_eikonal'] = loss_pts_sdf_grad
-            # if color_network.mode not in ('no_view_dir', 'points_grads_only'):
-            #     raise NotImplementedError("Eikonal loss + color loss")
-            # loss_pts_color = color_network(
-            #     loss_pts, loss_pts_sdf_grad.squeeze(), loss_pts, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
+            retval['gradients_eikonal'] = loss_pts_sdf_grad # K, 3
+
+            example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # K, 3
+            loss_pts_radiance_grad = color_network.gradient(
+                loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
+                loss_feature_vector.detach(), scene_idx) # 3, K, 3
+
+            retval['gradients_radiance'] = loss_pts_radiance_grad
 
         return retval
 
@@ -413,6 +416,7 @@ class NeuSRenderer:
 
         if compute_losses:
             retval['gradients_eikonal'] = ret_fine['gradients_eikonal']
+            retval['gradients_radiance'] = ret_fine['gradients_radiance']
 
         return retval
 
