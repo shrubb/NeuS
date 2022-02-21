@@ -422,15 +422,11 @@ class Runner:
 
                 # Radiance gradient loss
                 if self.radiance_grad_weight > 0:
-                    # dim 0: gradient of r/g/b
-                    # dim 1: point number
-                    # dim 2: gradient over x/y/z
-                    gradients_radiance = render_out['gradients_radiance'] # 3, K, 3
-                    gradients_eikonal_ = gradients_eikonal.detach()[None] # 1, K, 3
+                    radiance_at_loss_pts = render_out['radiance_at_loss_pts'] # M, 3
+                    radiance_at_loss_pts_shifted = render_out['radiance_at_loss_pts_shifted'] # M, 3
 
-                    # We want these gradients to be orthogonal, so force dot product to zero
-                    grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K
-                    radiance_grad_loss = (grads_dot_product ** 2).mean()
+                    radiance_grad_loss = \
+                        ((radiance_at_loss_pts_shifted - radiance_at_loss_pts) ** 2).mean()
                     loss += radiance_grad_loss * self.radiance_grad_weight
 
             # These values are only needed for logging

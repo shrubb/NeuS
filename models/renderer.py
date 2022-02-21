@@ -315,21 +315,39 @@ class NeuSRenderer:
             surface_pts += (torch.rand_like(surface_pts) - 0.5) * (NOISE_AMPLITUDE * 2)
 
             # Ray points
-            ray_pts_indices = torch.randperm(
-                len(pts), device=pts.device)[:batch_size * NUM_RANDOM_RAY_POINTS_PER_RAY]
-            ray_pts = pts[ray_pts_indices]
+            with torch.no_grad():
+                ray_pts_indices = torch.randperm(
+                    len(pts), device=pts.device)[:batch_size * NUM_RANDOM_RAY_POINTS_PER_RAY]
+                ray_pts = pts[ray_pts_indices]
 
             loss_pts = torch.cat([random_pts, surface_pts, ray_pts], dim=0) # M, 3
-            retval['relax_inside_sphere'] = (loss_pts.norm(2, dim=-1) < 1.2).float().detach()
+            assert not loss_pts.requires_grad
+            retval['relax_inside_sphere'] = (loss_pts.norm(2, dim=-1) < 1.2).float()
 
-            loss_pts_sdf_grad, loss_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
+            loss_pts_sdf_grad, loss_pts_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
             retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
-            example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
-            loss_pts_radiance_grad = color_network.gradient(
-                loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
-                loss_feature_vector.detach(), scene_idx)
-            retval['gradients_radiance'] = loss_pts_radiance_grad # 3, M, 3
+            # Step along the SDF gradient and query radiance there
+            STEP_SIZE_MIN = 0.005
+            STEP_SIZE_MAX = 0.04
+            loss_pts_step_length = torch.rand_like(loss_pts[:, :1]) * \
+                (STEP_SIZE_MAX - STEP_SIZE_MIN) + STEP_SIZE_MIN # M, 1
+            loss_pts_shifted = loss_pts + loss_pts_sdf_grad * loss_pts_step_length # M, 3
+
+            dummy_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
+            loss_pts_shifted_sdf_grad, loss_pts_shifted_feature_vector = \
+                sdf_network.gradient(loss_pts_shifted, scene_idx) # M, 3 / M, 256
+
+            radiance_loss_pts = color_network(
+                loss_pts, loss_pts_sdf_grad.detach(), dummy_viewdir,
+                loss_pts_feature_vector.detach(), scene_idx)
+            # TODO: loss_pts_shifted_feature_vector not used! maybe should use it below
+            radiance_loss_pts_shifted = color_network(
+                loss_pts_shifted, loss_pts_shifted_sdf_grad.detach(), dummy_viewdir,
+                loss_pts_feature_vector.detach(), scene_idx)
+
+            retval['radiance_at_loss_pts'] = radiance_loss_pts # M, 3
+            retval['radiance_at_loss_pts_shifted'] = radiance_loss_pts_shifted # M, 3
 
         return retval
 
@@ -438,7 +456,8 @@ class NeuSRenderer:
         if compute_losses:
             retval['relax_inside_sphere'] = ret_fine['relax_inside_sphere']
             retval['gradients_eikonal'] = ret_fine['gradients_eikonal']
-            retval['gradients_radiance'] = ret_fine['gradients_radiance']
+            retval['radiance_at_loss_pts'] = ret_fine['radiance_at_loss_pts']
+            retval['radiance_at_loss_pts_shifted'] = ret_fine['radiance_at_loss_pts_shifted']
 
         return retval
 
