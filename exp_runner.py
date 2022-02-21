@@ -171,7 +171,7 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight', default=0)
-        self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0)
+        self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=1e-7)
 
         self.mode = args.mode
         self.model_list = []
