@@ -328,11 +328,8 @@ class NeuSRenderer:
             retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
             # Step along the SDF gradient and query radiance there
-            STEP_SIZE_MIN = 0.005
-            STEP_SIZE_MAX = 0.04
-            loss_pts_step_length = torch.rand_like(loss_pts[:, :1]) * \
-                (STEP_SIZE_MAX - STEP_SIZE_MIN) + STEP_SIZE_MIN # M, 1
-            loss_pts_shifted = loss_pts + loss_pts_sdf_grad * loss_pts_step_length # M, 3
+            STEP_SIZE = 0.04
+            loss_pts_shifted = loss_pts + STEP_SIZE * loss_pts_sdf_grad # M, 3
 
             dummy_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
             loss_pts_shifted_sdf_grad, loss_pts_shifted_feature_vector = \

@@ -425,8 +425,8 @@ class Runner:
                     radiance_at_loss_pts = render_out['radiance_at_loss_pts'] # M, 3
                     radiance_at_loss_pts_shifted = render_out['radiance_at_loss_pts_shifted'] # M, 3
 
-                    radiance_grad_loss = \
-                        ((radiance_at_loss_pts_shifted - radiance_at_loss_pts) ** 2).mean()
+                    radiance_grad_loss = torch.nn.HuberLoss(delta=0.005)(
+                        radiance_at_loss_pts_shifted, radiance_at_loss_pts)
                     loss += radiance_grad_loss * self.radiance_grad_weight
 
             # These values are only needed for logging
