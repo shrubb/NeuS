@@ -86,7 +86,7 @@ class LowRankMultiLinear(nn.Module):
         # Initialize linear combination coefficients
         nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
 
-    def switch_to_finetuning(self, algorithm='pick'):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
         Like `SDFNetwork.switch_to_finetuning()`, but just for this layer.
 
@@ -97,7 +97,10 @@ class LowRankMultiLinear(nn.Module):
             - average (average coefficients over all scenes)
         """
         if algorithm == 'pick':
-            new_combination_coeffs = self.combination_coeffs[:1]
+            if scene_idx == -1:
+                new_combination_coeffs = self.combination_coeffs[:1] * 0
+            else:
+                new_combination_coeffs = self.combination_coeffs[scene_idx:scene_idx+1]
         elif algorithm == 'average':
             new_combination_coeffs = self.combination_coeffs.mean(0, keepdim=True)
         else:
@@ -684,6 +687,7 @@ class MultiSceneNeRF(nn.ModuleList):
             str
             One of:
             - pick (take the 0th scene's 'subnetwork')
+            - average (same as 'pick' because we don't use background in finetuning anyway)
         """
         if algorithm in ('pick', 'average'):
             super().__init__([self[0]])
@@ -710,10 +714,11 @@ class MultiSceneNeRF(nn.ModuleList):
 class SingleVarianceNetwork(nn.Module):
     def __init__(self, init_val):
         super(SingleVarianceNetwork, self).__init__()
-        self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
+        self.register_parameter('variance', nn.Parameter(torch.empty([])))
+        self.reset_parameters_(init_val)
 
-    def forward(self, size, device):
-        return torch.ones([size, 1], device=device) * torch.exp(self.variance * 10.0)
+    def forward(self, size):
+        return torch.exp(self.variance * 10.0).view(1, 1).expand(size, 1)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
@@ -725,3 +730,18 @@ class SingleVarianceNetwork(nn.Module):
             return []
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
+
+    def reset_parameters_(self, init_val):
+        with torch.no_grad():
+            self.variance.fill_(init_val)
+
+    def switch_to_finetuning(self, algorithm=None):
+        """
+        Switch the network trained on multiple scenes to the 'finetuning mode',
+        to finetune it to some new (one) scene.
+
+        algorithm
+            any type
+            No effect. For compatibility only.
+        """
+        pass # self.reset_parameters_(0.365)

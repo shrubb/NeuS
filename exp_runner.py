@@ -309,6 +309,7 @@ class Runner:
             with torch.no_grad():
                 self.sdf_network.switch_to_finetuning(finetuning_init_algorithm)
                 self.color_network.switch_to_finetuning(finetuning_init_algorithm)
+                self.deviation_network.switch_to_finetuning(finetuning_init_algorithm)
                 self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm)
 
         if not load_optimizer:
@@ -461,7 +462,7 @@ class Runner:
                         self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
                         self.writer.add_scalar('Loss/<dRGB,dSDF>', radiance_grad_loss, self.iter_step)
                     self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
-                    self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+                    self.writer.add_scalar('Statistics/s_val', s_val.item(), self.iter_step)
                     self.writer.add_scalar('Statistics/Learning rate', learning_rate_shared, self.iter_step)
                     self.writer.add_scalar('Statistics/Learning rate (scenewise)', learning_rate_scenewise, self.iter_step)
                     self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
