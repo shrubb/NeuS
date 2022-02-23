@@ -233,7 +233,7 @@ class NeuSRenderer:
         sampled_color = color_network(
             pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
-        inv_s = deviation_network(1, sdf.device).clip(1e-6, 1e6)           # Single parameter
+        inv_s = deviation_network(1).clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
 
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
@@ -279,7 +279,7 @@ class NeuSRenderer:
             'sdf': sdf,
             'dists': dists,
             'gradients': gradients.reshape(batch_size, n_samples, 3),
-            's_val': 1.0 / inv_s,
+            's_val': 1.0 / inv_s[0, 0],
             'mid_z_vals': mid_z_vals,
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
@@ -422,11 +422,10 @@ class NeuSRenderer:
         weights = ret_fine['weights']
         weights_sum = weights.sum(dim=-1, keepdim=True)
         gradients = ret_fine['gradients']
-        s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
 
         retval = {
             'color_fine': color_fine,
-            's_val': s_val,
+            's_val': ret_fine['s_val'],
             'cdf_fine': ret_fine['cdf'],
             'weight_sum': weights_sum,
             'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
