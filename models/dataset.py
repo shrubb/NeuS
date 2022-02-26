@@ -13,6 +13,7 @@ import random
 import os
 from glob import glob
 import pickle
+import multiprocessing
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
 def load_K_Rt_from_P(filename, P=None):
@@ -297,7 +298,7 @@ class Dataset(torch.utils.data.Dataset):
 
         image_idx:
             None or int
-            If None, sample from 5 random images in scene `scene_idx`.
+            If None, sample from 8 random images in scene `scene_idx`.
         """
         remaining_rays_to_sample = batch_size
 
@@ -317,7 +318,10 @@ class Dataset(torch.utils.data.Dataset):
 
         data_to_concat = collections.defaultdict(list)
 
-        for i, current_image_idx in enumerate(images_idxs_to_use):
+        # A more general/abstract interface, to support multithreaded processing in the future
+        def _get_rays(current_image_idx):
+            nonlocal remaining_rays_to_sample
+
             rgb, mask = self.get_image_and_mask(scene_idx, current_image_idx)
             l, t, r, b = self.object_bboxes[scene_idx][current_image_idx]
 
@@ -337,6 +341,9 @@ class Dataset(torch.utils.data.Dataset):
                 current_pixels, self.pose_all[scene_idx][current_image_idx, :3, :4],
                 self.intrinsics_all_inv[scene_idx][current_image_idx, :3, :3], self.H, self.W)
 
+            return rays_o, rays_v, rgb, mask
+
+        for rays_o, rays_v, rgb, mask in map(_get_rays, images_idxs_to_use):
             data_to_concat['rays_o'].append(rays_o)
             data_to_concat['rays_v'].append(rays_v)
             data_to_concat['rgb'].append(rgb)
@@ -414,8 +421,16 @@ class Dataset(torch.utils.data.Dataset):
 
                 return indices_generator(self.dataset_length)
 
+        def worker_init(*args):
+            import os
+            os.environ['OMP_NUM_THREADS'] = "4"
+            # global thread_pool
+            # N_THREADS = 4
+            # thread_pool = multiprocessing.pool.ThreadPool(N_THREADS)
+
         return torch.utils.data.DataLoader(
             self, batch_size=1, num_workers=1,
             sampler=InfiniteRandomSampler(len(self)),
-            collate_fn=lambda x: x[0], pin_memory=True)
+            collate_fn=lambda x: x[0], pin_memory=True,
+            worker_init_fn=worker_init)
 

@@ -170,7 +170,6 @@ class SDFNetwork(nn.Module):
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embed_fn_fine = None
-
         if multires > 0:
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
             self.embed_fn_fine = embed_fn
@@ -298,16 +297,16 @@ class SDFNetwork(nn.Module):
         with torch.enable_grad():
             x.requires_grad_(True)
             forward = self(x, scene_idx)
-            y, feature_vector = forward[:, :1], forward[:, 1:]
-            d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+            sdf, feature_vector = forward[:, :1], forward[:, 1:]
+            d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
             gradients = torch.autograd.grad(
-                outputs=y,
+                outputs=sdf,
                 inputs=x,
                 grad_outputs=d_output,
                 create_graph=True,
                 retain_graph=True,
                 only_inputs=True)[0]
-            return gradients, feature_vector
+            return gradients, sdf, feature_vector
 
     def switch_to_finetuning(self, algorithm='pick'):
         """
@@ -334,6 +333,8 @@ class SDFNetwork(nn.Module):
                         new_layer.get_parameter(param_name).copy_(averaged_param)
                 else:
                     raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+                self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
                 self.linear_layers[i].switch_to_finetuning(algorithm)
@@ -389,6 +390,7 @@ class RenderingNetwork(nn.Module):
                  scenewise_split_type='interleave',
                  scenewise_core_rank=None,
                  weight_norm=True,
+                 multires=0,
                  multires_view=0,
                  squeeze_out=True):
         super().__init__()
@@ -405,9 +407,14 @@ class RenderingNetwork(nn.Module):
 
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
 
+        self.embed_fn = None
+        if multires > 0:
+            self.embed_fn, input_ch = get_embedder(multires, input_dims=3)
+            dims[0] += input_ch - 3
+
         self.embedview_fn = None
         if multires_view > 0:
-            embedview_fn, input_ch = get_embedder(multires_view)
+            embedview_fn, input_ch = get_embedder(multires_view, input_dims=3)
             self.embedview_fn = embedview_fn
             dims[0] += (input_ch - 3)
 
@@ -461,6 +468,9 @@ class RenderingNetwork(nn.Module):
                 "Please address this.")
 
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
+        if self.embed_fn is not None:
+            points = self.embed_fn(points)
+
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
 
@@ -547,6 +557,8 @@ class RenderingNetwork(nn.Module):
                         new_layer.get_parameter(param_name).copy_(averaged_param)
                 else:
                     raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+                self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
                 self.linear_layers[i].switch_to_finetuning(algorithm)
