@@ -225,11 +225,7 @@ class NeuSRenderer:
         pts = pts.reshape(-1, 3)
         dirs = dirs.reshape(-1, 3)
 
-        sdf_nn_output = sdf_network(pts, scene_idx)
-        sdf = sdf_nn_output[:, :1]
-        feature_vector = sdf_nn_output[:, 1:]
-
-        gradients, _ = sdf_network.gradient(pts, scene_idx)
+        gradients, sdf, feature_vector = sdf_network.gradient(pts, scene_idx)
         sampled_color = color_network(
             pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
@@ -322,13 +318,36 @@ class NeuSRenderer:
             loss_pts = torch.cat([random_pts, surface_pts, ray_pts], dim=0) # M, 3
             retval['relax_inside_sphere'] = (loss_pts.norm(2, dim=-1) < 1.2).float().detach()
 
-            loss_pts_sdf_grad, loss_feature_vector = sdf_network.gradient(loss_pts, scene_idx)
+            loss_pts_sdf_grad, loss_pts_feature_vec, loss_feature_vector = \
+                sdf_network.gradient(loss_pts, scene_idx)
             retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
+            # compute gradient of radiance w.r.t x,y,z
             example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
-            loss_pts_radiance_grad = color_network.gradient(
+            assert loss_pts.requires_grad
+            loss_pts_radiance = color_network(
                 loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
-                loss_feature_vector.detach(), scene_idx)
+                loss_pts_feature_vec, scene_idx)
+
+            loss_pts_radiance_grad = []
+            for i in range(3): # R,G,B
+                d_output = torch.zeros_like(
+                    loss_pts_radiance, requires_grad=False, device=loss_pts_radiance.device)
+                d_output[..., i] = 1
+
+                loss_pts_radiance_grad.append(
+                    torch.autograd.grad(
+                        outputs=loss_pts_radiance,
+                        inputs=loss_pts,
+                        grad_outputs=d_output,
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True)[0])
+
+            # dim 0: gradient of r/g/b
+            # dim 1: point number
+            # dim 2: gradient over x/y/z
+            loss_pts_radiance_grad = torch.stack(loss_pts_radiance_grad) # 3, M, 3
             retval['gradients_radiance'] = loss_pts_radiance_grad # 3, M, 3
 
         return retval
