@@ -318,7 +318,7 @@ class NeuSRenderer:
             loss_pts = torch.cat([random_pts, surface_pts, ray_pts], dim=0) # M, 3
             retval['relax_inside_sphere'] = (loss_pts.norm(2, dim=-1) < 1.2).float().detach()
 
-            loss_pts_sdf_grad, loss_pts_feature_vec, loss_feature_vector = \
+            loss_pts_sdf_grad, _, loss_pts_feature_vec = \
                 sdf_network.gradient(loss_pts, scene_idx)
             retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
