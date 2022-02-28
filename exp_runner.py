@@ -170,8 +170,8 @@ class Runner:
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
-        self.mask_weight = self.conf.get_float('train.mask_weight', default=0)
-        self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=1e-7)
+        self.mask_weight = self.conf.get_float('train.mask_weight', default=0.0)
+        self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0.0)
 
         self.mode = args.mode
         self.model_list = []
@@ -363,6 +363,7 @@ class Runner:
             mask = mask.cuda()
             near = near.cuda()
             far = far.cuda()
+            # ZERO = torch.zeros(1, 1).cuda()
 
             mask_sum = mask.sum() + 1e-5
 
@@ -371,10 +372,12 @@ class Runner:
                 background_rgb = torch.ones([1, 3])
 
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
-                                                  background_rgb=background_rgb,
-                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                  compute_losses=self.radiance_grad_weight > 0)
+                render_out = self.renderer.render(
+                    rays_o, rays_d, near, far, scene_idx,
+                    background_rgb=background_rgb,
+                    cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                    compute_eikonal_loss=self.igr_weight > 0,
+                    compute_radiance_grad_loss=self.radiance_grad_weight > 0)
 
                 color_fine = render_out['color_fine']
                 s_val = render_out['s_val']
@@ -405,14 +408,7 @@ class Runner:
                     loss += mask_loss * self.mask_weight
 
                 # Eikonal loss
-                if self.igr_weight > 0 and self.radiance_grad_weight == 0:
-                    raise ValueError(
-                        "For now, `radiance_grad_weight` must be > 0 for " \
-                        "eikonal loss to get computed")
-
-                # For now, `radiance_grad_weight > 0` implies computing eikonal
-                # loss at extra random points
-                if self.radiance_grad_weight > 0:
+                if self.igr_weight > 0:
                     # boolean mask, 1 if point is inside 1-sphere
                     relax_inside_sphere = render_out['relax_inside_sphere']
 
@@ -434,6 +430,8 @@ class Runner:
                     # We want these gradients to be orthogonal, so force dot product to zero
                     grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K
                     radiance_grad_loss = (grads_dot_product ** 2).mean()
+                    # radiance_grad_loss = torch.nn.HuberLoss(delta=0.0122)(
+                    #     grads_dot_product, ZERO.expand_as(grads_dot_product))
                     loss += radiance_grad_loss * self.radiance_grad_weight
 
             # These values are only needed for logging
@@ -639,7 +637,8 @@ class Runner:
                                                       val_scene_idx,
                                                       cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                                       background_rgb=background_rgb,
-                                                      compute_losses=False)
+                                                      compute_eikonal_loss=False,
+                                                      compute_radiance_grad_loss=False)
 
                     def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
@@ -713,7 +712,8 @@ class Runner:
                                               scene_idx,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb,
-                                              compute_losses=False)
+                                              compute_eikonal_loss=False,
+                                              compute_radiance_grad_loss=False)
 
             rgb_all.append(render_out['color_fine'].detach().cpu().numpy())
 

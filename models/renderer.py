@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 import mcubes
-from icecream import ic
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func, device='cuda'):
@@ -209,7 +208,8 @@ class NeuSRenderer:
                     background_sampled_color=None,
                     background_rgb=None,
                     cos_anneal_ratio=0.0,
-                    compute_losses=False):
+                    compute_eikonal_loss=True,
+                    compute_radiance_grad_loss=False):
         batch_size, n_samples = z_vals.shape
 
         # Section length
@@ -282,7 +282,7 @@ class NeuSRenderer:
             'inside_sphere': inside_sphere,
         }
 
-        if compute_losses:
+        if compute_eikonal_loss or compute_radiance_grad_loss:
             # Generate points:
             # some totally random points + some random points near the surface + some ray points
             NUM_RANDOM_PTS_PER_RAY = 6
@@ -322,40 +322,41 @@ class NeuSRenderer:
                 sdf_network.gradient(loss_pts, scene_idx)
             retval['gradients_eikonal'] = loss_pts_sdf_grad # M, 3
 
-            # compute gradient of radiance w.r.t x,y,z
-            example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
-            assert loss_pts.requires_grad
-            loss_pts_radiance = color_network(
-                loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
-                loss_pts_feature_vec, scene_idx)
+            if compute_radiance_grad_loss:
+                # compute gradient of radiance w.r.t x,y,z
+                example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
+                assert loss_pts.requires_grad
+                loss_pts_radiance = color_network(
+                    loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
+                    loss_pts_feature_vec, scene_idx) # M, 3
 
-            loss_pts_radiance_grad = []
-            for i in range(3): # R,G,B
-                d_output = torch.zeros_like(
-                    loss_pts_radiance, requires_grad=False, device=loss_pts_radiance.device)
-                d_output[..., i] = 1
+                loss_pts_radiance_grad = []
+                for i in range(3): # R,G,B
+                    d_output = torch.zeros_like(
+                        loss_pts_radiance, requires_grad=False, device=loss_pts_radiance.device)
+                    d_output[..., i] = 1
 
-                loss_pts_radiance_grad.append(
-                    torch.autograd.grad(
-                        outputs=loss_pts_radiance,
-                        inputs=loss_pts,
-                        grad_outputs=d_output,
-                        create_graph=True,
-                        retain_graph=True,
-                        only_inputs=True)[0])
+                    loss_pts_radiance_grad.append(
+                        torch.autograd.grad(
+                            outputs=loss_pts_radiance,
+                            inputs=loss_pts,
+                            grad_outputs=d_output,
+                            create_graph=True,
+                            retain_graph=True,
+                            only_inputs=True)[0]) # M, 3
 
-            # dim 0: gradient of r/g/b
-            # dim 1: point number
-            # dim 2: gradient over x/y/z
-            loss_pts_radiance_grad = torch.stack(loss_pts_radiance_grad) # 3, M, 3
-            retval['gradients_radiance'] = loss_pts_radiance_grad # 3, M, 3
+                # dim 0: gradient of r/g/b
+                # dim 1: point number
+                # dim 2: gradient over x/y/z
+                loss_pts_radiance_grad = torch.stack(loss_pts_radiance_grad) # 3, M, 3
+                retval['gradients_radiance'] = loss_pts_radiance_grad # 3, M, 3
 
         return retval
 
     def render(self,
         rays_o, rays_d, near, far, scene_idx,
         perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0,
-        compute_losses=False):
+        compute_eikonal_loss=True, compute_radiance_grad_loss=False):
 
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
@@ -435,7 +436,8 @@ class NeuSRenderer:
                                     background_alpha=background_alpha,
                                     background_sampled_color=background_sampled_color,
                                     cos_anneal_ratio=cos_anneal_ratio,
-                                    compute_losses=compute_losses)
+                                    compute_eikonal_loss=compute_eikonal_loss,
+                                    compute_radiance_grad_loss=compute_radiance_grad_loss)
 
         color_fine = ret_fine['color']
         weights = ret_fine['weights']
@@ -453,9 +455,10 @@ class NeuSRenderer:
             'inside_sphere': ret_fine['inside_sphere'],
         }
 
-        if compute_losses:
+        if compute_eikonal_loss:
             retval['relax_inside_sphere'] = ret_fine['relax_inside_sphere']
             retval['gradients_eikonal'] = ret_fine['gradients_eikonal']
+        if compute_radiance_grad_loss:
             retval['gradients_radiance'] = ret_fine['gradients_radiance']
 
         return retval
