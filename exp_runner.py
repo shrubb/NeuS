@@ -81,9 +81,18 @@ class Runner:
             if checkpoint_path is None:
                 checkpoint_path = checkpoint_path_from_config
 
+        # Get experiment dir
+        # first, set from config file
+        self.base_exp_dir = config_from_file.get_string('general.base_exp_dir', default=None)
+        # then, if defined on the command line, override
+        base_exp_dir_from_cmdline = ConfigFactory.parse_string(
+            args.extra_config_args).get_string('general.base_exp_dir', default=None)
+        if base_exp_dir_from_cmdline is not None:
+            self.base_exp_dir = base_exp_dir_from_cmdline
+
         # Try to find the latest checkpoint
         if checkpoint_path is None:
-            checkpoints_dir = pathlib.Path(config_from_file.get_string('general.base_exp_dir')) / "checkpoints"
+            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
             if checkpoints_dir.is_dir():
                 checkpoints = sorted(checkpoints_dir.iterdir())
             else:
@@ -113,7 +122,6 @@ class Runner:
         if args.extra_config_args is not None:
             update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
 
-        self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'], kind='train')
         self.dataset_val = Dataset(self.conf['dataset'], kind='val')
