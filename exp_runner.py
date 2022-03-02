@@ -762,7 +762,8 @@ class Runner:
                 pts = torch.tensor(vertices[i * k: (i + 1) * k], dtype=torch.float32, device=self.device)
                 sdf_nn_output = self.sdf_network(pts, scene_idx)
                 feature_vector = sdf_nn_output[:, 1:]
-                gradients = self.sdf_network.gradient(pts, scene_idx).squeeze()
+                gradients, _, _ = self.sdf_network.gradient(pts, scene_idx)
+                gradients = gradients.squeeze()
                 dirs = gradients
                 vertex_colors.append(self.color_network(pts, gradients, dirs, feature_vector, scene_idx).cpu().numpy())
         vertex_colors = np.concatenate(vertex_colors, axis=0)
