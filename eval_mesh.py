@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+
 from typing import Dict, Union, Tuple
 
 import pytorch3d
@@ -8,12 +9,24 @@ import torch
 import torch.utils.data
 import trimesh
 from pytorch3d.ops import sample_points_from_meshes
+from pytorch3d.renderer import (
+    look_at_view_transform,
+    FoVPerspectiveCameras,
+    PointLights,
+    RasterizationSettings,
+    MeshRenderer,
+    MeshRasterizer,
+    SoftPhongShader,
+    Textures
+)
 from pytorch3d.structures import Meshes, Pointclouds
+from torchvision.utils import save_image
 
 from utils.comm import synchronize, is_main_process, get_world_size
 from utils.compute_iou import compute_iou
 from utils.inside_mesh import inside_mesh
 from utils.point_to_face import point_mesh_face_distances
+from utils.uni_cd import unidirectional_chamfer_distance
 
 
 class MeshEvaluator:
@@ -128,6 +141,46 @@ class MeshEvaluator:
 
         return metrics
 
+    @torch.no_grad()
+    def visualize_errors(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
+        if isinstance(mesh_pred, str):
+            mesh_pred = self.read_mesh(mesh_pred)
+
+        dist = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None], self.samples_gt)  # (1, n)
+
+        # fixme use better colormap
+        dist /= (dist.max().item() + 1e-6)
+        dist = dist[:, :, None].expand(1, -1, 3)
+
+        mesh_error_colored = Meshes(
+            verts=mesh_pred.verts_list(),
+            faces=mesh_pred.faces_list(),
+            textures=Textures(verts_rgb=dist),
+        )
+
+        # todo feed R, T, intrinsics as parameters
+        R, T = look_at_view_transform(2.7, 0, 180)
+        cameras = FoVPerspectiveCameras(device=self.device, R=R, T=T)
+        raster_settings = RasterizationSettings(
+            image_size=512,
+            blur_radius=0.0,
+            faces_per_pixel=1,
+        )
+        lights = PointLights(device=self.device, location=cameras.get_camera_center())
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(
+                cameras=cameras,
+                raster_settings=raster_settings
+            ),
+            shader=SoftPhongShader(
+                device=self.device,
+                cameras=cameras,
+                lights=lights
+            )
+        )
+        image = renderer(mesh_error_colored)[0, ..., :3].cpu()
+        return image
+
 
 def md5(path):
     with open(path, "rb") as f:
@@ -148,3 +201,5 @@ if __name__ == '__main__':
     evaluator = MeshEvaluator(args.gt_mesh)
     metrics = evaluator.compute_metrics(args.mesh)
     print(metrics)
+    image = evaluator.visualize_errors(args.mesh)
+    save_image(image.permute(2, 0, 1), 'image.png')
