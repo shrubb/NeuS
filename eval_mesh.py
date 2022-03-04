@@ -1,22 +1,22 @@
 import argparse
 import hashlib
 import os
+from typing import Dict, Union, Tuple, Optional
 
-from typing import Dict, Union, Tuple
-
+import matplotlib.cm
+import matplotlib.colors
 import pytorch3d
 import torch
 import torch.utils.data
 import trimesh
 from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.renderer import (
-    look_at_view_transform,
-    FoVPerspectiveCameras,
+    PerspectiveCameras,
     PointLights,
     RasterizationSettings,
     MeshRenderer,
     MeshRasterizer,
-    SoftPhongShader,
+    HardGouraudShader,
     Textures
 )
 from pytorch3d.structures import Meshes, Pointclouds
@@ -30,7 +30,9 @@ from utils.uni_cd import unidirectional_chamfer_distance
 
 
 class MeshEvaluator:
-    def __init__(self, path_gt: str, num_samples: int = 100000, device: torch.device = torch.device('cuda')):
+    def __init__(self, path_gt: str, num_samples: int = 100000, device: torch.device = torch.device('cuda'),
+                 use_gt_vertices_as_samples: bool = True):
+        self.use_gt_vertices_as_samples = use_gt_vertices_as_samples
         self.path_gt: str = path_gt
         self.num_samples: int = num_samples
         self.device: torch.device = device
@@ -38,7 +40,10 @@ class MeshEvaluator:
         self.bbox_gt: torch.Tensor = self.mesh_gt.get_bounding_boxes()  # (1, 3, 2)
         self.samples_gt, self.normals_gt = self.get_gt_samples()
 
-    def get_gt_samples(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_gt_samples(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.use_gt_vertices_as_samples:
+            return self.mesh_gt.verts_list()[0][None], None
+
         cache_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path: str = os.path.join(cache_dir, f"{md5(self.path_gt)}_{self.num_samples}.pt")
@@ -67,9 +72,11 @@ class MeshEvaluator:
 
     def read_mesh(self, path: str) -> Meshes:
         mesh = trimesh.load_mesh(path)
+        rgb = (torch.from_numpy(mesh.visual.vertex_colors[:, :3]) / 255).float()
         return Meshes(
             verts=[torch.from_numpy(mesh.vertices).float()],
-            faces=[torch.from_numpy(mesh.faces).long()]
+            faces=[torch.from_numpy(mesh.faces).long()],
+            textures=Textures(verts_rgb=rgb[None]),
         ).to(self.device)
 
     def compute_chamfer(self, samples_pred, normals_pred) -> Dict:
@@ -142,29 +149,41 @@ class MeshEvaluator:
         return metrics
 
     @torch.no_grad()
-    def visualize_errors(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
+    def visualize_mesh(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
         if isinstance(mesh_pred, str):
             mesh_pred = self.read_mesh(mesh_pred)
 
-        dist = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None], self.samples_gt)  # (1, n)
+        # intrinsics
+        K = torch.tensor([
+            [670, 0, 256, 0],
+            [0, 670, 256, 0],
+            [0, 0, 0, 1],
+            [0, 0, 1, 0]
+        ], device=self.device, dtype=torch.float32)[None]
+        image_size = (512, 512)
 
-        # fixme use better colormap
-        dist /= (dist.max().item() + 1e-6)
-        dist = dist[:, :, None].expand(1, -1, 3)
+        # extrinsics
+        pose = torch.tensor([
+            [9.9659306e-01, 7.6131098e-02, 3.1722244e-02, -1.6078455e+01],
+            [-7.9632021e-02, 9.8833752e-01, 1.2979856e-01, -6.3538975e+01],
+            [-2.1470578e-02, -1.3188246e-01, 9.9103284e-01, -6.1367126e+02],
+            [0.0000000e+00, 0.0000000e+00, 0.0000000e+00, 1.0000000e+00]
+        ], device=self.device, dtype=torch.float32)
+        RtT = torch.inverse(pose)
+        RtT[:2, :] *= -1
+        R = RtT[:3, :3].T[None]
+        T = RtT[:3, 3][None]
 
-        mesh_error_colored = Meshes(
-            verts=mesh_pred.verts_list(),
-            faces=mesh_pred.faces_list(),
-            textures=Textures(verts_rgb=dist),
-        )
-
-        # todo feed R, T, intrinsics as parameters
-        R, T = look_at_view_transform(2.7, 0, 180)
-        cameras = FoVPerspectiveCameras(device=self.device, R=R, T=T)
+        cameras = PerspectiveCameras(R=R, T=T, K=K,
+                                     device=self.device, in_ndc=False,
+                                     image_size=torch.tensor(image_size).view(1, 2))
         raster_settings = RasterizationSettings(
-            image_size=512,
-            blur_radius=0.0,
+            image_size=image_size,
+            blur_radius=1e-6,
             faces_per_pixel=1,
+            clip_barycentric_coords=True,
+            cull_backfaces=True,
+            perspective_correct=True,
         )
         lights = PointLights(device=self.device, location=cameras.get_camera_center())
         renderer = MeshRenderer(
@@ -172,14 +191,34 @@ class MeshEvaluator:
                 cameras=cameras,
                 raster_settings=raster_settings
             ),
-            shader=SoftPhongShader(
-                device=self.device,
-                cameras=cameras,
-                lights=lights
-            )
+            shader=HardGouraudShader(device=self.device, cameras=cameras, lights=lights)
         )
-        image = renderer(mesh_error_colored)[0, ..., :3].cpu()
+        image = renderer(mesh_pred)[0, ..., :3].cpu()
         return image
+
+    @torch.no_grad()
+    def visualize_errors(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
+        if isinstance(mesh_pred, str):
+            mesh_pred = self.read_mesh(mesh_pred)
+
+        dist2 = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None], self.samples_gt)  # (1, n)
+        dist = torch.sqrt(dist2)
+        # print(dist.mean())
+
+        # vmax = torch.quantile(dist, 0.5).item()
+        # print("VMAX", vmax)
+        vmax = 3.0
+        norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
+        rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist.cpu().numpy()))[..., :3]
+        rgb = torch.from_numpy(rgb).float().to(self.device)
+
+        mesh_error_colored = Meshes(
+            verts=mesh_pred.verts_list(),
+            faces=mesh_pred.faces_list(),
+            textures=Textures(verts_rgb=rgb),
+        )
+
+        return self.visualize_mesh(mesh_error_colored)
 
 
 def md5(path):
@@ -199,7 +238,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     evaluator = MeshEvaluator(args.gt_mesh)
-    metrics = evaluator.compute_metrics(args.mesh)
-    print(metrics)
-    image = evaluator.visualize_errors(args.mesh)
+    # metrics = evaluator.compute_metrics(args.mesh)
+    # print(metrics)
+    image = evaluator.visualize_mesh(args.mesh)
     save_image(image.permute(2, 0, 1), 'image.png')
+    errors = evaluator.visualize_errors(args.mesh)
+    save_image(errors.permute(2, 0, 1), 'errors.png')
