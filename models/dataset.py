@@ -52,6 +52,10 @@ def load_camera_matrices(path):
     # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
     scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(n_images)]
 
+    reg_mats_np = None
+    if 'reg_mat_0' in camera_dict:
+        reg_mats_np = [camera_dict['reg_mat_%d' % idx].astype(np.float32) for idx in range(n_images)]
+
     intrinsics_all = []
     pose_all = []
 
@@ -66,7 +70,7 @@ def load_camera_matrices(path):
     pose_all = torch.stack(pose_all)  # [n_images, 4, 4]
     focal = intrinsics_all[0][0, 0]
 
-    return pose_all, intrinsics_all, scale_mats_np, focal
+    return pose_all, intrinsics_all, scale_mats_np, reg_mats_np, focal
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -158,11 +162,14 @@ class Dataset(torch.utils.data.Dataset):
                 [torch.from_numpy(cv.imread(str(im_name))[..., 0]) for im_name in masks_list])
 
             # Load camera parameters
-            pose_all, intrinsics_all, scale_mats_np, focal = \
+            pose_all, intrinsics_all, scale_mats_np, reg_mats_np, focal = \
                 load_camera_matrices(os.path.join(root_dir, render_cameras_name))
             pose_all = pose_all[image_idxs_to_pick]
             intrinsics_all = intrinsics_all[image_idxs_to_pick]
             scale_mats_np = [scale_mats_np[i] for i in image_idxs_to_pick]
+            if reg_mats_np is not None:
+                reg_mats_np = [reg_mats_np[i] for i in image_idxs_to_pick]
+                assert len(reg_mats_np) == n_images
 
             assert len(pose_all) == n_images
             assert len(intrinsics_all) == n_images
@@ -182,13 +189,13 @@ class Dataset(torch.utils.data.Dataset):
 
                 obj_bboxes = [process_object_bbox(obj_bboxes[i]) for i in image_idxs_to_pick]
 
-            return images, masks, pose_all, intrinsics_all, scale_mats_np, focal, obj_bboxes
+            return images, masks, pose_all, intrinsics_all, scale_mats_np, reg_mats_np, focal, obj_bboxes
 
         all_data = [load_one_scene(data_dir, images_to_pick, kind=kind) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, \
-            self.scale_mats_np, self.focal, self.object_bboxes = zip(*all_data)
+            self.scale_mats_np, self.reg_mats_np, self.focal, self.object_bboxes = zip(*all_data)
 
         self.pose_all = [x.to(self.device) if x != [] else [] for x in self.pose_all]
         self.intrinsics_all = [x.to(self.device) if x != [] else [] for x in self.intrinsics_all]

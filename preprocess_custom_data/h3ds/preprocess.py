@@ -124,6 +124,9 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_vie
 
     # mesh_original = Ref_transform @ mesh_transformed
     # mesh_transformed = Ref_transform^-1 @ mesh_original
+
+    # full_head.ply = normalize(mesh)
+    mesh.export(output_path / "mesh_orig.ply")
     mesh.apply_transform(np.linalg.inv(registration_transform))
     mesh.export(output_path / "mesh.ply")
     logger.info(f"Saving gt mesh in reference coordinates: {registration_transform.tolist()}")
