@@ -15,7 +15,7 @@ sys.path.append('../gonzalo')
 try:
     import h3ds
 
-    assert h3ds.__version__ == "0.1.1"
+    assert h3ds.__version__ == "0.2.0"
     from h3ds.dataset import H3DS
 except ModuleNotFoundError:
     pass
@@ -26,7 +26,7 @@ from gonzalo.preprocess import ImageCropper, triangulate_anchor_landmarks, \
 logger = logging.getLogger('h3ds')
 
 
-def preprocess_folders(folders: List[pathlib.Path]):
+def preprocess_folders(folders: List[pathlib.Path], output_root: pathlib.Path):
     """
     Given a list of paths to scenes, preprocess each of them.
 
@@ -37,17 +37,17 @@ def preprocess_folders(folders: List[pathlib.Path]):
     for i, folder in enumerate(folders):
         logger.info(f"Preprocessing {folder} ({i + 1}/{len(folders)})")
         start_time = perf_counter()
-        preprocess_folder(folder, image_cropper)
+        preprocess_folder(output_root, folder, image_cropper)
         end_time = perf_counter()
         logger.info(f"Done, took {end_time - start_time} seconds")
 
 
-def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_views=3):
+def preprocess_folder(output_root: pathlib.Path, folder: pathlib.Path, image_cropper: ImageCropper, num_views='all'):
     h3ds_dir = folder.parent
     scene_id = folder.name
-    h3ds = H3DS(path=h3ds_dir)
+    h3ds = H3DS(h3ds_dir, "./config-v0.1.1.toml")
 
-    output_path = pathlib.Path("/gpfs/gpfs0/3ddl/datasets/H3DS_processed") / scene_id
+    output_path = output_root / scene_id
     output_images_preview_path = output_path / "images-preview"
     output_images_path = output_path / "image"
     output_masks_path = output_path / "mask"
@@ -72,7 +72,7 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_vie
 
     for label, (intrinsics, pose) in sorted(zip(labels, cameras), key=lambda x: x[0]):
         image_path = folder / "image" / f"img_{label}.jpg"
-        mask_path = folder / "rigid_masks" / f"mask_{label}.jpg"
+        mask_path = folder / "mask" / f"mask_{label}.png"
         image = cv2.imread(str(image_path))
 
         try:
@@ -132,8 +132,9 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_vie
     logger.info(f"Saving gt mesh in reference coordinates: {registration_transform.tolist()}")
 
 if __name__ == '__main__':
-    # python preprocess.py --folders f1 f2 f3 f4 f5
+    # python preprocess.py /gpfs/data/gpfs0/egor.burkov/Datasets/H3DS_preprocessed folder1 folder2 folder3 folder4
     parser = argparse.ArgumentParser()
+    parser.add_argument('output_root', type=pathlib.Path)
     parser.add_argument('folders', type=pathlib.Path, nargs='+')
     args = parser.parse_args()
-    preprocess_folders(args.folders)
+    preprocess_folders(args.output_root, args.folders)
