@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import apex
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
+from pyhocon.converter import HOCONConverter
 
 import random
 import pathlib
@@ -38,10 +39,8 @@ class Runner:
         checkpoint_path = args.checkpoint_path
         self.device = args.device
 
-        assert conf_path or checkpoint_path, "Specify at least config or checkpoint"
-
-        # The eventual configuration, gradually filled from various sources
-        self.conf = ConfigFactory.parse_string("")
+        assert conf_path or checkpoint_path or args.extra_config_args, \
+            "Specify at least config, checkpoint or extra_config_args"
 
         def update_config_tree(target: ConfigTree, source: ConfigTree, current_prefix: str = ''):
             """
@@ -69,42 +68,39 @@ class Runner:
 
                         target[key] = source[key]
 
-        # Load the config file, for now just to extract the checkpoint path from it
-        self.conf_path = conf_path
+        # The eventual configuration, gradually filled from various sources
+        # Config params resolution order: cmdline -> file -> checkpoint
+        self.conf = ConfigFactory.parse_string("")
         if conf_path is not None:
             if self.rank == 0: logging.info(f"Using config '{conf_path}'")
-            config_from_file = ConfigFactory.parse_file(conf_path)
+            update_config_tree(self.conf, ConfigFactory.parse_file(conf_path))
+        if args.extra_config_args is not None:
+            update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
 
-            checkpoint_path_from_config = \
-                config_from_file.get_string('train.checkpoint_path', default=None)
-
-            if checkpoint_path is None:
-                checkpoint_path = checkpoint_path_from_config
-
-        # Get experiment dir
-        # first, set from config file
-        self.base_exp_dir = config_from_file.get_string('general.base_exp_dir', default=None)
-        # then, if defined on the command line, override
-        base_exp_dir_from_cmdline = ConfigFactory.parse_string(
-            args.extra_config_args).get_string('general.base_exp_dir', default=None)
-        if base_exp_dir_from_cmdline is not None:
-            self.base_exp_dir = base_exp_dir_from_cmdline
-
-        # Try to find the latest checkpoint
+        # Now we know where to look for checkpoint
         if checkpoint_path is None:
-            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
-            if checkpoints_dir.is_dir():
-                checkpoints = sorted(checkpoints_dir.iterdir())
-            else:
-                checkpoints = []
+            # If not specified as cmdline argument, get from config
+            checkpoint_path = self.conf.get_string('train.checkpoint_path', default=None)
+        if checkpoint_path is None:
+            # If not specified anywhere, try looking in 'base_exp_dir'
+            base_exp_dir = self.conf.get_string('general.base_exp_dir', default=None)
+            if base_exp_dir is not None:
+                checkpoints_dir = pathlib.Path(base_exp_dir) / "checkpoints"
+                if checkpoints_dir.is_dir():
+                    checkpoints = sorted(checkpoints_dir.iterdir())
+                else:
+                    checkpoints = []
 
-            if checkpoints:
-                checkpoint_path = checkpoints[-1]
-
-        # Load the checkpoint, for now just to extract config from there
-        if checkpoint_path is not None:
+                if checkpoints:
+                    checkpoint_path = checkpoints[-1]
+        if checkpoint_path is None:
+            if self.rank == 0: logging.info(f"Not loading any checkpoint")
+        else:
+            # Load the checkpoint, for now just to extract config from there
             if self.rank == 0: logging.info(f"Loading checkpoint '{checkpoint_path}'")
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+            self.conf = ConfigFactory.parse_string("")
 
             if 'config' in checkpoint:
                 # Temporary dynamic defaults for backward compatibility. TODO: remove
@@ -113,14 +109,13 @@ class Runner:
                         len(checkpoint['config']['dataset.data_dirs'])
 
                 update_config_tree(self.conf, checkpoint['config'])
+            if conf_path is not None:
+                update_config_tree(self.conf, ConfigFactory.parse_file(conf_path))
+            if args.extra_config_args is not None:
+                update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
 
-        # Now actually process the config file and merge it
-        if conf_path is not None:
-            update_config_tree(self.conf, config_from_file)
-
-        # Finally, update config with extra command line args
-        if args.extra_config_args is not None:
-            update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
+        self.base_exp_dir = self.conf.get_string('general.base_exp_dir', default=None)
+        assert self.base_exp_dir is not None, "'base_exp_dir' not defined anywhere"
 
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'], kind='train')
@@ -343,12 +338,18 @@ class Runner:
 
     # This is to average gradients of shared parameters after each iteration
     def average_shared_gradients_between_GPUs(self):
+        if self.world_size == 1:
+            return
+
         gradients = [x.grad for x in self._shared_parameters if x.grad is not None]
         with torch.no_grad():
             apex.parallel.distributed.flat_dist_call(gradients, torch.distributed.all_reduce)
 
     # This is to average model parameters between GPUs
     def average_parameters_between_GPUs(self):
+        if self.world_size == 1:
+            return
+
         parameters = sum([x['params'] for x in self.optimizer.param_groups], [])
         with torch.no_grad():
             apex.parallel.distributed.flat_dist_call(parameters, torch.distributed.all_reduce)
@@ -534,8 +535,8 @@ class Runner:
                 if f_name[-3:] == '.py':
                     copyfile(os.path.join(dir_name, f_name), os.path.join(cur_dir, f_name))
 
-        if self.conf_path is not None:
-            copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
+        with open(os.path.join(self.base_exp_dir, 'recording', 'config.conf'), 'w') as f:
+            f.write(HOCONConverter().to_hocon(self.conf))
 
     def load_checkpoint(self,
         checkpoint: dict, parts_to_skip_loading: List[str] = [], load_optimizer: bool = True):
