@@ -89,21 +89,30 @@ def unidirectional_chamfer_distance(
     y, y_lengths, y_normals = _handle_pointcloud_input(y, None, None)
 
     N, P1, D = x.shape
+    P2 = y.shape[1]
 
     # Check if inputs are heterogeneous and create a lengths mask.
     is_x_heterogeneous = (x_lengths != P1).any()
+    is_y_heterogeneous = (y_lengths != P2).any()
     x_mask = (
             torch.arange(P1, device=x.device)[None] >= x_lengths[:, None]
     )  # shape [N, P1]
+    y_mask = (
+            torch.arange(P2, device=y.device)[None] >= y_lengths[:, None]
+    )  # shape [N, P2]
 
     if y.shape[0] != N or y.shape[2] != D:
         raise ValueError("y does not have the correct shape.")
 
     x_nn = knn_points(x, y, lengths1=x_lengths, lengths2=y_lengths, K=1)
+    y_nn = knn_points(y, x, lengths1=y_lengths, lengths2=x_lengths, K=1)
 
     cham_x = x_nn.dists[..., 0]  # (N, P1)
+    cham_y = y_nn.dists[..., 0]  # (N, P2)
 
     if is_x_heterogeneous:
         cham_x[x_mask] = 0.0
+    if is_y_heterogeneous:
+        cham_y[y_mask] = 0.0
 
-    return cham_x
+    return cham_x, cham_y

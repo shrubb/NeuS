@@ -5,10 +5,13 @@ from typing import Dict, Union, Tuple, Optional
 
 import matplotlib.cm
 import matplotlib.colors
+import numpy as np
 import pytorch3d
 import torch
+import torch.nn as nn
 import torch.utils.data
 import trimesh
+from h3ds.dataset import H3DS
 from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.renderer import (
     PerspectiveCameras,
@@ -19,30 +22,47 @@ from pytorch3d.renderer import (
     HardGouraudShader,
     Textures
 )
+from pytorch3d.renderer.blending import hard_rgb_blend, BlendParams
 from pytorch3d.structures import Meshes, Pointclouds
 from torchvision.utils import save_image
 
 from utils.comm import synchronize, is_main_process, get_world_size
 from utils.compute_iou import compute_iou
 from utils.inside_mesh import inside_mesh
+from utils.mesh import Mesh
+from utils.numeric import perform_icp, transform_mesh
 from utils.point_to_face import point_mesh_face_distances
 from utils.uni_cd import unidirectional_chamfer_distance
 
 
+class SimpleShader(nn.Module):
+    def __init__(self, device="cpu", blend_params=None, **kwargs):
+        super().__init__()
+        self.blend_params = blend_params if blend_params is not None else BlendParams()
+
+    def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
+        blend_params = kwargs.get("blend_params", self.blend_params)
+        texels = meshes.sample_textures(fragments)
+        images = hard_rgb_blend(texels, fragments, blend_params)
+        return images  # (N, H, W, 3) RGBA image
+
+
 class MeshEvaluator:
     def __init__(self, path_gt: str, num_samples: int = 100000, device: torch.device = torch.device('cuda'),
-                 use_gt_vertices_as_samples: bool = True):
-        self.use_gt_vertices_as_samples = use_gt_vertices_as_samples
+                 h3ds_scene_id: Optional[str] = None):
+        self.h3ds_scene_id = h3ds_scene_id
+        if self.h3ds_scene_id is not None:
+            self.h3ds_dataset = H3DS(path='/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS')
         self.path_gt: str = path_gt
         self.num_samples: int = num_samples
         self.device: torch.device = device
-        self.mesh_gt: Meshes = self.read_mesh(path_gt)
+        self.mesh_gt: Meshes = self.read_mesh(path_gt, gt=True)
         self.bbox_gt: torch.Tensor = self.mesh_gt.get_bounding_boxes()  # (1, 3, 2)
         self.samples_gt, self.normals_gt = self.get_gt_samples()
 
     def get_gt_samples(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.use_gt_vertices_as_samples:
-            return self.mesh_gt.verts_list()[0][None], None
+        if self.h3ds_scene_id is not None:
+            return self.mesh_gt.verts_list()[0][None], None  # self.mesh_gt.verts_normals_list()[0][None]
 
         cache_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -70,13 +90,27 @@ class MeshEvaluator:
             self._max_side = sides.max().item()
         return self._max_side
 
-    def read_mesh(self, path: str) -> Meshes:
-        mesh = trimesh.load_mesh(path)
-        rgb = (torch.from_numpy(mesh.visual.vertex_colors[:, :3]) / 255).float()
+    def read_mesh(self, path: str, read_texture: bool = True, gt=False) -> Meshes:
+        mesh = Mesh().load(path, read_texture)
+
+        if not gt:
+            region_gt = None
+            if self.h3ds_scene_id is not None:
+                region_id = None  # face | face_sphere | nose
+                region_gt = self.h3ds_dataset.load_region(self.h3ds_scene_id, region_id or 'face')
+            _, t_icp = perform_icp(self._mesh_gt, mesh, region_gt)
+            mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
+
+        # mesh.compute_normals()
+
+        if gt:
+            self._mesh_gt = mesh
+
         return Meshes(
             verts=[torch.from_numpy(mesh.vertices).float()],
+            # verts_normals=[torch.from_numpy(mesh.vertex_normals).float()],
             faces=[torch.from_numpy(mesh.faces).long()],
-            textures=Textures(verts_rgb=rgb[None]),
+            textures=Textures(verts_rgb=torch.from_numpy(mesh.vertices_color).float()[None]),
         ).to(self.device)
 
     def compute_chamfer(self, samples_pred, normals_pred) -> Dict:
@@ -128,6 +162,9 @@ class MeshEvaluator:
             fs[f'f-score-{q}'] = fscore.item()
         return fs
 
+    # def sample_points_from_pred_meshes(self, mesh, num_samples):
+    #     if num_samples
+
     @torch.no_grad()
     def compute_metrics(self, mesh_pred: Union[str, Meshes]) -> Dict:
         # the volumetric IoU and a normal consistency score
@@ -149,9 +186,9 @@ class MeshEvaluator:
         return metrics
 
     @torch.no_grad()
-    def visualize_mesh(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
+    def visualize_mesh(self, mesh_pred: Union[str, Meshes], shader, read_texture=True) -> torch.Tensor:
         if isinstance(mesh_pred, str):
-            mesh_pred = self.read_mesh(mesh_pred)
+            mesh_pred = self.read_mesh(mesh_pred, read_texture)
 
         # intrinsics
         K = torch.tensor([
@@ -191,7 +228,9 @@ class MeshEvaluator:
                 cameras=cameras,
                 raster_settings=raster_settings
             ),
-            shader=HardGouraudShader(device=self.device, cameras=cameras, lights=lights)
+            # shader=HardGouraudShader(device=self.device, cameras=cameras, lights=lights),
+            # shader=SimpleShader()
+            shader=shader(device=self.device, cameras=cameras, lights=lights),
         )
         image = renderer(mesh_pred)[0, ..., :3].cpu()
         return image
@@ -201,15 +240,18 @@ class MeshEvaluator:
         if isinstance(mesh_pred, str):
             mesh_pred = self.read_mesh(mesh_pred)
 
-        dist2 = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None], self.samples_gt)  # (1, n)
-        dist = torch.sqrt(dist2)
-        # print(dist.mean())
+        dist2_pred, dist2_gt = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None],
+                                                               self.samples_gt)  # (1, n)
+        dist_pred = torch.sqrt(dist2_pred)
+        dist_gt = torch.sqrt(dist2_gt)
+        # print(dist_pred.shape, dist2_pred.mean(), dist_pred.mean())
+        # print(dist_gt.shape, dist_gt.mean())
 
-        # vmax = torch.quantile(dist, 0.5).item()
-        # print("VMAX", vmax)
-        vmax = 3.0
+        vmax = torch.quantile(dist_pred, 0.5).item()
+        print("VMAX", vmax)
+        # vmax = 3.0
         norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
-        rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist.cpu().numpy()))[..., :3]
+        rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist_pred.cpu().numpy()))[..., :3]
         rgb = torch.from_numpy(rgb).float().to(self.device)
 
         mesh_error_colored = Meshes(
@@ -218,7 +260,7 @@ class MeshEvaluator:
             textures=Textures(verts_rgb=rgb),
         )
 
-        return self.visualize_mesh(mesh_error_colored)
+        return self.visualize_mesh(mesh_error_colored, SimpleShader)
 
 
 def md5(path):
@@ -235,12 +277,21 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mesh', type=str, default=None)
     parser.add_argument('--gt_mesh', type=str, default=None)
+    parser.add_argument('--scene_id', type=str, default=None)
     args = parser.parse_args()
 
-    evaluator = MeshEvaluator(args.gt_mesh)
+    evaluator = MeshEvaluator(args.gt_mesh, h3ds_scene_id=args.scene_id)
     # metrics = evaluator.compute_metrics(args.mesh)
     # print(metrics)
-    image = evaluator.visualize_mesh(args.mesh)
-    save_image(image.permute(2, 0, 1), 'image.png')
+    if args.scene_id is not None:
+        h3ds_dataset = H3DS(path='/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS')
+        mesh_pred = trimesh.load_mesh(args.mesh)
+        chamfer_gt, chamfer_pred, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred)
+        print("h3ds chamfer gt: ", chamfer_gt.shape, chamfer_gt.mean())
+        print("h3ds chamfer pred: ", chamfer_pred.shape, chamfer_pred.mean())
+    texture = evaluator.visualize_mesh(args.mesh, SimpleShader)
+    save_image(texture.permute(2, 0, 1), 'texture.png')
+    geometry = evaluator.visualize_mesh(args.mesh, HardGouraudShader, read_texture=False)
+    save_image(geometry.permute(2, 0, 1), 'geometry.png')
     errors = evaluator.visualize_errors(args.mesh)
     save_image(errors.permute(2, 0, 1), 'errors.png')
