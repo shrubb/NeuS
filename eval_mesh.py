@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import os
+from time import perf_counter
 from typing import Dict, Union, Tuple, Optional
 
 import matplotlib.cm
@@ -45,6 +46,12 @@ class SimpleShader(nn.Module):
         texels = meshes.sample_textures(fragments)
         images = hard_rgb_blend(texels, fragments, blend_params)
         return images  # (N, H, W, 3) RGBA image
+
+
+def get_reg_transform(scene_id):
+    camera_path = f'/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS_preprocessed/{scene_id}/cameras_sphere.npz'
+    camera_dict = np.load(camera_path)
+    return camera_dict['reg_mat_0']
 
 
 class MeshEvaluator:
@@ -96,8 +103,10 @@ class MeshEvaluator:
         if not gt:
             region_gt = None
             if self.h3ds_scene_id is not None:
+                mesh = transform_mesh(mesh, get_reg_transform(self.h3ds_scene_id))
                 region_id = None  # face | face_sphere | nose
                 region_gt = self.h3ds_dataset.load_region(self.h3ds_scene_id, region_id or 'face')
+
             _, t_icp = perform_icp(self._mesh_gt, mesh, region_gt)
             mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
 
@@ -247,9 +256,9 @@ class MeshEvaluator:
         # print(dist_pred.shape, dist2_pred.mean(), dist_pred.mean())
         # print(dist_gt.shape, dist_gt.mean())
 
-        vmax = torch.quantile(dist_pred, 0.5).item()
-        print("VMAX", vmax)
-        # vmax = 3.0
+        # vmax = torch.quantile(dist_pred, 0.5).item()
+        # print("VMAX", vmax)
+        vmax = 20.0
         norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
         rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist_pred.cpu().numpy()))[..., :3]
         rgb = torch.from_numpy(rgb).float().to(self.device)
@@ -274,11 +283,16 @@ def md5(path):
 
 
 if __name__ == '__main__':
+    start_time = perf_counter()
     parser = argparse.ArgumentParser()
     parser.add_argument('--mesh', type=str, default=None)
     parser.add_argument('--gt_mesh', type=str, default=None)
     parser.add_argument('--scene_id', type=str, default=None)
+    parser.add_argument('--out_dir', type=str, default=None)
     args = parser.parse_args()
+
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
 
     evaluator = MeshEvaluator(args.gt_mesh, h3ds_scene_id=args.scene_id)
     # metrics = evaluator.compute_metrics(args.mesh)
@@ -286,12 +300,28 @@ if __name__ == '__main__':
     if args.scene_id is not None:
         h3ds_dataset = H3DS(path='/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS')
         mesh_pred = trimesh.load_mesh(args.mesh)
-        chamfer_gt, chamfer_pred, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred)
-        print("h3ds chamfer gt: ", chamfer_gt.shape, chamfer_gt.mean())
-        print("h3ds chamfer pred: ", chamfer_pred.shape, chamfer_pred.mean())
+        mesh_pred.apply_transform(get_reg_transform(args.scene_id))
+        head_chamfer_gt, _, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred)
+        print(f"h3ds chamfer gt (full head): ", head_chamfer_gt.shape, head_chamfer_gt.mean())
+        face_chamfer_gt, _, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred, region_id='face')
+        print(f"h3ds chamfer gt (face): ", face_chamfer_gt.shape, face_chamfer_gt.mean())
+
+        metrics_path = os.path.join("outputs", "metrics.csv")
+        write_head = not os.path.exists(metrics_path)
+        f = open(metrics_path, "a")
+        if write_head:
+            f.write("scene_id,head,face,mesh\n")
+        f.write(f"{args.scene_id},{head_chamfer_gt.mean()},{face_chamfer_gt.mean()},{args.mesh}\n")
+        f.close()
+
     texture = evaluator.visualize_mesh(args.mesh, SimpleShader)
-    save_image(texture.permute(2, 0, 1), 'texture.png')
+    save_image(texture.permute(2, 0, 1), os.path.join(out_dir, 'texture.png'))
     geometry = evaluator.visualize_mesh(args.mesh, HardGouraudShader, read_texture=False)
-    save_image(geometry.permute(2, 0, 1), 'geometry.png')
+    save_image(geometry.permute(2, 0, 1), os.path.join(out_dir, 'geometry.png'))
     errors = evaluator.visualize_errors(args.mesh)
-    save_image(errors.permute(2, 0, 1), 'errors.png')
+    save_image(errors.permute(2, 0, 1), os.path.join(out_dir, 'errors.png'))
+    gt_geometry = evaluator.visualize_mesh(evaluator.mesh_gt, HardGouraudShader, read_texture=False)
+    save_image(gt_geometry.permute(2, 0, 1), os.path.join(out_dir, 'gt_geometry.png'))
+
+    end_time = perf_counter()
+    print(f"Finished {args.out_dir} in {end_time - start_time} seconds.")
