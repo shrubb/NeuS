@@ -98,7 +98,7 @@ class Runner:
         else:
             # Load the checkpoint, for now just to extract config from there
             if self.rank == 0: logging.info(f"Loading checkpoint '{checkpoint_path}'")
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
             self.conf = ConfigFactory.parse_string("")
 
@@ -480,7 +480,7 @@ class Runner:
                         print(self.base_exp_dir)
                         print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-                    if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
+                    if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                         self.save_checkpoint()
 
                     if self.iter_step % self.val_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:

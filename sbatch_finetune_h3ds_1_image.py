@@ -8,6 +8,7 @@ def run_subprocess(command, working_dir=None):
         sys.stdout.buffer.write(c)
 
 if __name__ == '__main__':
+    VIEW_NAMES = ('left', 'frontal', 'right')
     SCENES = [
         ("1b2a8613401e42a8", ["0018", "0000", "0065"]),
         ("3b5a2eb92a501d54", ["0015", "0001", "0062"]),
@@ -20,7 +21,7 @@ if __name__ == '__main__':
         ("e98bae39fad2244e", ["0011", "0000", "0064"]),
         ("f7e930d8a9ff2091", ["0009", "0000", "0065"]),
     ]
-    MODEL_NAME = "gonzalo_100_layers1x_2GPU"
+    MODEL_NAME = "100_rank1000_smallLR"
 
     port = 26100
 
@@ -28,10 +29,11 @@ if __name__ == '__main__':
         dataset_dir = pathlib.Path(f"./datasets/H3DS_processed/{scene}")
         assert dataset_dir.is_dir()
 
-        for image in images:
+        for image, view_name in zip(images, VIEW_NAMES):
             experiment_name = f"{MODEL_NAME}_ftTo{scene[:4]}-1-{image}"
-            exp_dir = pathlib.Path(f"./logs/paper/h3ds/{MODEL_NAME}/{experiment_name}")
+            exp_dir = pathlib.Path(f"./logs/paper/h3ds/{MODEL_NAME}/{view_name}/{scene}-1-{image}")
             if exp_dir.is_dir():
+                print(f"Already exists, skipping: {exp_dir}")
                 port += 1
                 continue
             exp_dir.mkdir(exist_ok=True, parents=True)
@@ -45,10 +47,12 @@ f"""#!/bin/bash
 #SBATCH --output ./stdout/%A.txt
 #SBATCH --time 0-4
 
-#SBATCH -p gpu_a100,gpu,htc,res,gpu_devel
+##SBATCH -p gpu_devel
 #SBATCH --gres gpu:1
-#SBATCH --cpus-per-gpu 5
+#SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
+
+#SBATCH --reservation egor.burkov_80
 
 set -e
 
@@ -75,4 +79,3 @@ torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_
             run_subprocess(["sbatch", "tmp.sh"])
 
             port += 1
-
