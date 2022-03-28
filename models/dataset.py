@@ -2,7 +2,7 @@ from typing import List
 
 import torch
 import torch.utils.data
-import cv2 as cv
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
@@ -26,7 +26,7 @@ def load_K_Rt_from_P(filename, P=None):
         lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines)]
         P = np.asarray(lines).astype(np.float32).squeeze()
 
-    out = cv.decomposeProjectionMatrix(P)
+    out = cv2.decomposeProjectionMatrix(P)
     K = out[0]
     R = out[1]
     t = out[2]
@@ -148,15 +148,18 @@ class Dataset(torch.utils.data.Dataset):
             n_images = len(images_list)
             # [n_images, H, W, 3], uint8
             images = torch.stack(
-                [torch.from_numpy(cv.imread(str(im_name))) for im_name in images_list])
+                [torch.from_numpy(cv2.imread(str(im_name))) for im_name in images_list])
             H, W = images.shape[1:3]
 
             masks_list = sorted(x for x in (root_dir / "mask").iterdir() if x.suffix == '.png')
             masks_list = [masks_list[i] for i in image_idxs_to_pick]
 
+            def read_mask(path):
+                retval = cv2.imread(str(path))
+                # retval = cv2.erode(retval, None, iterations=5, borderType=cv2.BORDER_REPLICATE)
+                return torch.from_numpy(retval[..., 0])
             # [n_images, H, W, 1], uint8
-            masks = torch.stack(
-                [torch.from_numpy(cv.imread(str(im_name))[..., 0]) for im_name in masks_list])
+            masks = torch.stack([read_mask(im_name) for im_name in masks_list])
 
             # Load camera parameters
             pose_all, intrinsics_all, scale_mats_np, focal = \

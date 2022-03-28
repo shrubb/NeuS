@@ -355,7 +355,9 @@ class Runner:
             apex.parallel.distributed.flat_dist_call(parameters, torch.distributed.all_reduce)
 
     def train(self):
-        self.writer = SummaryWriter(log_dir=self.base_exp_dir)
+        if self.rank == 0:
+            self.writer = SummaryWriter(log_dir=self.base_exp_dir)
+
         res_step = self.end_iter - self.iter_step
 
         data_loader = iter(self.dataset.get_dataloader())
@@ -690,11 +692,12 @@ class Runner:
         render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
         normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)
 
-        self.writer.add_image(
-            'Image/Render (val)', render_images, self.iter_step, dataformats='HWC')
-        self.writer.add_image(
-            'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
-        self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
+        if self.rank == 0:
+            self.writer.add_image(
+                'Image/Render (val)', render_images, self.iter_step, dataformats='HWC')
+            self.writer.add_image(
+                'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
+            self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
     def render_novel_image(self, scene_idx, idx_0, idx_1, ratio, resolution_level):
         """

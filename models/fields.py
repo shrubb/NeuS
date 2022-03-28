@@ -10,7 +10,7 @@ class LowRankMultiLinear(nn.Module):
     """N linear layers whose weights are linearly regressed at forward pass from smaller
     matrices, leading to "lower rank" (lower DoF) parametrization.
     """
-    def __init__(self, n_scenes, in_dim, out_dim, rank, weight_norm=False):
+    def __init__(self, n_scenes, in_dim, out_dim, rank, weight_norm=False, use_bias=False):
         """
         rank:
             How many instances of weights (`P`) are learned.
@@ -18,6 +18,7 @@ class LowRankMultiLinear(nn.Module):
         """
         super().__init__()
         assert rank > 0
+        self.use_bias = use_bias
         if weight_norm:
             raise NotImplementedError("weight_norm + low-rank Linear layers")
 
@@ -25,10 +26,12 @@ class LowRankMultiLinear(nn.Module):
 
         basis_weights = {}
         for parameter_name, parameter in self.linear_layers[0].named_parameters():
-            basis_weights[parameter_name] = nn.Parameter(torch.empty(parameter.shape + (rank,)))
+            basis_weights[parameter_name] = nn.Parameter(
+                torch.empty(parameter.shape + (rank + use_bias,)))
 
-        self.basis_weights = nn.ParameterDict(basis_weights) # 'weight': out_dim x in_dim x rank
-        self.combination_coeffs = nn.Parameter(torch.empty(n_scenes, rank)) # n_scenes x rank
+        self.basis_weights = nn.ParameterDict(basis_weights) # 'weight': out_dim x in_dim x rank[+1]
+        self.combination_coeffs = nn.Parameter(
+            torch.empty(n_scenes, rank)) # n_scenes x rank
 
         # A an application of PyTorch 'parametrization' functionality
         class LowRankWeight(nn.Module):
@@ -55,10 +58,14 @@ class LowRankMultiLinear(nn.Module):
                 """
                 # (rank)
                 combination_coeffs = self.multi_linear_module.combination_coeffs[self.scene_idx]
-                # (out_dim x in_dim x rank) - in case `parameter_name` is 'weight'
+                # (out_dim x in_dim x rank[+1]) - in case `parameter_name` is 'weight'
                 parameter_basis = self.multi_linear_module.basis_weights[self.parameter_name]
+
                 # (out_dim x in_dim)
-                return parameter_basis @ combination_coeffs
+                if self.multi_linear_module.use_bias:
+                    return parameter_basis[..., :-1] @ combination_coeffs + parameter_basis[..., -1]
+                else:
+                    return parameter_basis @ combination_coeffs
 
         for parameter_name, _ in list(self.linear_layers[0].named_parameters()):
             for scene_idx, layer in enumerate(self.linear_layers):
@@ -73,15 +80,22 @@ class LowRankMultiLinear(nn.Module):
 
     def reset_parameters_(self):
         _, in_dim, rank = self.basis_weights['weight'].shape
+        if self.use_bias:
+            rank -= 1
+        assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
         for i in range(rank):
             # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
             nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i], a=np.sqrt(5))
+        if self.use_bias:
+            self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
         bound = 1 / np.sqrt(in_dim)
         nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
+        if self.use_bias:
+            self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
         nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
@@ -135,6 +149,7 @@ class SDFNetwork(nn.Module):
                  n_scenes,
                  scenewise_split_type='interleave',
                  scenewise_core_rank=None,
+                 scenewise_bias=False,
                  skip_in=(4,),
                  multires=0,
                  bias=0.5,
@@ -234,13 +249,16 @@ class SDFNetwork(nn.Module):
                     lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 else:
                     lin = LowRankMultiLinear(
-                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm)
+                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm, scenewise_bias)
 
                     if geometric_init:
                         for i in range(scenewise_core_rank):
                             geometric_init_(
                                 lin.basis_weights['weight'][..., i],
                                 lin.basis_weights['bias'][..., i])
+                        if scenewise_bias:
+                            lin.basis_weights['weight'][..., -1].fill_(0)
+                            lin.basis_weights['bias'][..., -1].fill_(0)
 
                 total_scene_specific_layers += 1
             else:
@@ -389,6 +407,7 @@ class RenderingNetwork(nn.Module):
                  n_scenes,
                  scenewise_split_type='interleave',
                  scenewise_core_rank=None,
+                 scenewise_bias=False,
                  weight_norm=True,
                  multires=0,
                  multires_view=0,
@@ -446,7 +465,7 @@ class RenderingNetwork(nn.Module):
                         [maybe_weight_norm(nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
                 else:
                     lin = LowRankMultiLinear(
-                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm)
+                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm, scenewise_bias)
                 total_scene_specific_layers += 1
             else:
                 lin = maybe_weight_norm(nn.Linear(in_dim, out_dim))
