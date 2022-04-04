@@ -54,10 +54,23 @@ def get_reg_transform(scene_id):
     return camera_dict['reg_mat_0']
 
 
+def error_to_color(errors, clipping_error=None):
+    if clipping_error is not None:
+        errors_norm = np.clip(errors / float(clipping_error), 0., 1.)
+    else:
+        errors_norm = (errors - errors.min()) / (errors.max() - errors.min())
+
+    hsv = np.ones((errors.shape[-1], 3))
+    hsv[:, 0] = (1. - errors_norm) / 3.
+
+    return matplotlib.colors.hsv_to_rgb(hsv)
+
+
 class MeshEvaluator:
     def __init__(self, path_gt: str, num_samples: int = 100000, device: torch.device = torch.device('cuda'),
-                 h3ds_scene_id: Optional[str] = None):
+                 h3ds_scene_id: Optional[str] = None, h3ds_region_id: Optional[str] = None):
         self.h3ds_scene_id = h3ds_scene_id
+        self.h3ds_region_id = h3ds_region_id
         if self.h3ds_scene_id is not None:
             self.h3ds_dataset = H3DS(path='/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS')
         self.path_gt: str = path_gt
@@ -97,23 +110,37 @@ class MeshEvaluator:
             self._max_side = sides.max().item()
         return self._max_side
 
-    def read_mesh(self, path: str, read_texture: bool = True, gt=False) -> Meshes:
+    def read_mesh(self, path: str, read_texture: bool = True, gt=False, cut_pred=False) -> Meshes:
         mesh = Mesh().load(path, read_texture)
 
-        if not gt:
-            region_gt = None
-            if self.h3ds_scene_id is not None:
-                mesh = transform_mesh(mesh, get_reg_transform(self.h3ds_scene_id))
-                region_id = None  # face | face_sphere | nose
-                region_gt = self.h3ds_dataset.load_region(self.h3ds_scene_id, region_id or 'face')
-
-            _, t_icp = perform_icp(self._mesh_gt, mesh, region_gt)
-            mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
-
-        # mesh.compute_normals()
+        region_gt = None
+        if self.h3ds_scene_id is not None:
+            region_gt = self.h3ds_dataset.load_region(self.h3ds_scene_id, self.h3ds_region_id or 'face')
 
         if gt:
+            self._uncutted_mesh_gt = mesh
+            if self.h3ds_region_id:
+                mesh = mesh.cut(region_gt)
             self._mesh_gt = mesh
+        else:
+            if self.h3ds_scene_id is not None:
+                # костыль, так как не сохранено в экспериментах изначально по-нормальному
+                mesh = transform_mesh(mesh, get_reg_transform(self.h3ds_scene_id))
+
+            _, t_icp = perform_icp(self._uncutted_mesh_gt, mesh, region_gt)
+            mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
+
+            if self.h3ds_scene_id is not None and self.h3ds_region_id == 'face_sphere' and cut_pred:
+                # when metric is calculated the mesh is uncutted
+                # for visualization otherwise
+                landmarks_true = self.h3ds_dataset.load_landmarks(self.h3ds_scene_id)
+                mask_sphere = np.where(
+                    np.linalg.norm(mesh.vertices -
+                                   self._uncutted_mesh_gt.vertices[landmarks_true['nose_tip']],
+                                   axis=-1) < 95)
+                mesh = mesh.cut(mask_sphere)
+
+        # mesh.compute_normals()
 
         return Meshes(
             verts=[torch.from_numpy(mesh.vertices).float()],
@@ -197,7 +224,7 @@ class MeshEvaluator:
     @torch.no_grad()
     def visualize_mesh(self, mesh_pred: Union[str, Meshes], shader, read_texture=True) -> torch.Tensor:
         if isinstance(mesh_pred, str):
-            mesh_pred = self.read_mesh(mesh_pred, read_texture)
+            mesh_pred = self.read_mesh(mesh_pred, read_texture, cut_pred=True)
 
         # intrinsics
         K = torch.tensor([
@@ -214,6 +241,16 @@ class MeshEvaluator:
             [-7.9632021e-02, 9.8833752e-01, 1.2979856e-01, -6.3538975e+01],
             [-2.1470578e-02, -1.3188246e-01, 9.9103284e-01, -6.1367126e+02],
             [0.0000000e+00, 0.0000000e+00, 0.0000000e+00, 1.0000000e+00]
+
+            # [8.7044e-01, 1.6037e-01, -4.6542e-01, 1.3151e+00],
+            # [-1.1271e-01, 9.8526e-01, 1.2871e-01, -5.2989e-01],
+            # [4.7920e-01, -5.9573e-02, 8.7568e-01, -2.6827e+00],
+            # [0.0000e+00, 0.0000e+00, 0.0000e+00, 1.0000e+00]
+
+            # [0.6131477, 0.23778298, -0.7533321, 2.9539409],
+            # [-0.16528392, 0.97113144, 0.17200263, -0.3341688],
+            # [0.77248377, 0.01905067, 0.6347487, 0.3226022],
+            # [0., 0., 0., 1., ]
         ], device=self.device, dtype=torch.float32)
         RtT = torch.inverse(pose)
         RtT[:2, :] *= -1
@@ -247,21 +284,22 @@ class MeshEvaluator:
     @torch.no_grad()
     def visualize_errors(self, mesh_pred: Union[str, Meshes]) -> torch.Tensor:
         if isinstance(mesh_pred, str):
-            mesh_pred = self.read_mesh(mesh_pred)
+            mesh_pred = self.read_mesh(mesh_pred, cut_pred=True)
 
         dist2_pred, dist2_gt = unidirectional_chamfer_distance(mesh_pred.verts_list()[0][None],
                                                                self.samples_gt)  # (1, n)
         dist_pred = torch.sqrt(dist2_pred)
-        dist_gt = torch.sqrt(dist2_gt)
-        # print(dist_pred.shape, dist2_pred.mean(), dist_pred.mean())
-        # print(dist_gt.shape, dist_gt.mean())
 
-        # vmax = torch.quantile(dist_pred, 0.5).item()
-        # print("VMAX", vmax)
-        vmax = 20.0
-        norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
-        rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist_pred.cpu().numpy()))[..., :3]
-        rgb = torch.from_numpy(rgb).float().to(self.device)
+        # dist_gt = torch.sqrt(dist2_gt)
+        # print("dist_gt.mean(): ", dist_gt.mean(), dist_gt.shape)
+
+        # vmax = 20.0
+        # norm = matplotlib.colors.Normalize(vmin=0, vmax=vmax)
+        # rgb = matplotlib.cm.get_cmap("RdYlGn_r")(norm(dist_pred.cpu().numpy()))[..., :3]
+        # rgb = torch.from_numpy(rgb).float().to(self.device)
+
+        rgb = error_to_color(dist_pred.cpu().numpy(), clipping_error=5)
+        rgb = torch.from_numpy(rgb).float().to(self.device)[None]  # (1, n, 3)
 
         mesh_error_colored = Meshes(
             verts=mesh_pred.verts_list(),
@@ -269,7 +307,8 @@ class MeshEvaluator:
             textures=Textures(verts_rgb=rgb),
         )
 
-        return self.visualize_mesh(mesh_error_colored, SimpleShader)
+        # return self.visualize_mesh(mesh_error_colored, SimpleShader)
+        return self.visualize_mesh(mesh_error_colored, HardGouraudShader)
 
 
 def md5(path):
@@ -294,34 +333,38 @@ if __name__ == '__main__':
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    evaluator = MeshEvaluator(args.gt_mesh, h3ds_scene_id=args.scene_id)
-    # metrics = evaluator.compute_metrics(args.mesh)
-    # print(metrics)
     if args.scene_id is not None:
         h3ds_dataset = H3DS(path='/gpfs/data/gpfs0/egor.burkov/Datasets/H3DS')
+
         mesh_pred = trimesh.load_mesh(args.mesh)
         mesh_pred.apply_transform(get_reg_transform(args.scene_id))
         head_chamfer_gt, _, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred)
-        print(f"h3ds chamfer gt (full head): ", head_chamfer_gt.shape, head_chamfer_gt.mean())
+        print(f' > Chamfer distance full head (mm): {head_chamfer_gt.mean()}, {head_chamfer_gt.shape}')
         face_chamfer_gt, _, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred, region_id='face')
-        print(f"h3ds chamfer gt (face): ", face_chamfer_gt.shape, face_chamfer_gt.mean())
+        print(f' > Chamfer distance face (mm): {face_chamfer_gt.mean()}, {face_chamfer_gt.shape}')
+        face_sphere_chamfer_gt, _, _, _ = h3ds_dataset.evaluate_scene(args.scene_id, mesh_pred, region_id='face_sphere')
+        print(f' > Chamfer distance face_sphere (mm): {face_sphere_chamfer_gt.mean()}, {face_sphere_chamfer_gt.shape}')
 
-        metrics_path = os.path.join("outputs", "metrics.csv")
-        write_head = not os.path.exists(metrics_path)
-        f = open(metrics_path, "a")
-        if write_head:
-            f.write("scene_id,head,face,mesh\n")
-        f.write(f"{args.scene_id},{head_chamfer_gt.mean()},{face_chamfer_gt.mean()},{args.mesh}\n")
-        f.close()
+        # metrics_path = os.path.join("outputs2", "metrics.csv")
+        # write_head = not os.path.exists(metrics_path)
+        # f = open(metrics_path, "a")
+        # if write_head:
+        #     f.write("scene_id,head,face,face_sphere,mesh\n")
+        # f.write(f"{args.scene_id},{head_chamfer_gt.mean()},{face_chamfer_gt.mean()},{face_sphere_chamfer_gt.mean()},{args.mesh}\n")
+        # f.close()
 
-    texture = evaluator.visualize_mesh(args.mesh, SimpleShader)
-    save_image(texture.permute(2, 0, 1), os.path.join(out_dir, 'texture.png'))
-    geometry = evaluator.visualize_mesh(args.mesh, HardGouraudShader, read_texture=False)
-    save_image(geometry.permute(2, 0, 1), os.path.join(out_dir, 'geometry.png'))
-    errors = evaluator.visualize_errors(args.mesh)
-    save_image(errors.permute(2, 0, 1), os.path.join(out_dir, 'errors.png'))
-    gt_geometry = evaluator.visualize_mesh(evaluator.mesh_gt, HardGouraudShader, read_texture=False)
-    save_image(gt_geometry.permute(2, 0, 1), os.path.join(out_dir, 'gt_geometry.png'))
+    region_ids = [None, 'face_sphere'] if args.scene_id is not None else [None]
+    for region_id in region_ids:
+        region_suf = 'full' if region_id is None else region_id
+        evaluator = MeshEvaluator(args.gt_mesh, h3ds_scene_id=args.scene_id, h3ds_region_id=region_id)
+        texture = evaluator.visualize_mesh(args.mesh, SimpleShader)
+        save_image(texture.permute(2, 0, 1), os.path.join(out_dir, f'texture_{region_suf}.png'))
+        geometry = evaluator.visualize_mesh(args.mesh, HardGouraudShader, read_texture=False)
+        save_image(geometry.permute(2, 0, 1), os.path.join(out_dir, f'geometry_{region_suf}.png'))
+        errors = evaluator.visualize_errors(args.mesh)
+        save_image(errors.permute(2, 0, 1), os.path.join(out_dir, f'errors_{region_suf}.png'))
+        gt_geometry = evaluator.visualize_mesh(evaluator.mesh_gt, HardGouraudShader, read_texture=False)
+        save_image(gt_geometry.permute(2, 0, 1), os.path.join(out_dir, f'gt_geometry_{region_suf}.png'))
 
     end_time = perf_counter()
     print(f"Finished {args.out_dir} in {end_time - start_time} seconds.")
