@@ -21,9 +21,9 @@ if __name__ == '__main__':
         ("e98bae39fad2244e", ["0011", "0000", "0064"]),
         ("f7e930d8a9ff2091", ["0009", "0000", "0065"]),
     ]
-    MODEL_NAME = "100_rank1000_smallLR"
+    MODEL_NAME = "100_rank2000_smallLR_restart"
 
-    port = 26100
+    port = 25100
 
     for scene, images in SCENES:
         dataset_dir = pathlib.Path(f"./datasets/H3DS_processed/{scene}")
@@ -31,7 +31,7 @@ if __name__ == '__main__':
 
         for image, view_name in zip(images, VIEW_NAMES):
             experiment_name = f"{MODEL_NAME}_ftTo{scene[:4]}-1-{image}"
-            exp_dir = pathlib.Path(f"./logs/paper/h3ds/{MODEL_NAME}/{view_name}/{scene}-1-{image}")
+            exp_dir = pathlib.Path(f"./logs-paper/h3ds/{MODEL_NAME}/{view_name}/{scene}-1-{image}")
             if exp_dir.is_dir():
                 print(f"Already exists, skipping: {exp_dir}")
                 port += 1
@@ -45,14 +45,14 @@ f"""#!/bin/bash
 
 #SBATCH --job-name {experiment_name}
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 0-4
+#SBATCH --time 4:30:0
 
-##SBATCH -p gpu_devel
+#SBATCH -p gpu_a100 # res,htc,gpu,gpu_a100,gpu_devel
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
 
-#SBATCH --reservation egor.burkov_80
+##SBATCH --reservation egor.burkov_80
 
 set -e
 

@@ -89,13 +89,15 @@ class LowRankMultiLinear(nn.Module):
             # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
             nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i], a=np.sqrt(5))
         if self.use_bias:
-            self.basis_weights['weight'][..., -1].fill_(0)
+            with torch.no_grad():
+                self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
         bound = 1 / np.sqrt(in_dim)
         nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
         if self.use_bias:
-            self.basis_weights['bias'][..., -1].fill_(0)
+            with torch.no_grad():
+                self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
         nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
@@ -208,6 +210,8 @@ class SDFNetwork(nn.Module):
                 layer_is_scene_specific = l % 2 == 1
             elif scenewise_split_type == 'interleave_with_skips':
                 layer_is_scene_specific = l % 2 == 1 and in_dim == out_dim
+            elif scenewise_split_type == 'interleave_with_skips_and_last':
+                layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
             elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
@@ -257,8 +261,9 @@ class SDFNetwork(nn.Module):
                                 lin.basis_weights['weight'][..., i],
                                 lin.basis_weights['bias'][..., i])
                         if scenewise_bias:
-                            lin.basis_weights['weight'][..., -1].fill_(0)
-                            lin.basis_weights['bias'][..., -1].fill_(0)
+                            with torch.no_grad():
+                                lin.basis_weights['weight'][..., -1].fill_(0)
+                                lin.basis_weights['bias'][..., -1].fill_(0)
 
                 total_scene_specific_layers += 1
             else:
@@ -273,6 +278,7 @@ class SDFNetwork(nn.Module):
         self.activation = nn.Softplus(beta=100)
 
         self.is_lowrank = scenewise_core_rank is not None
+        self.dims = dims
 
         # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
         if len(list(super().parameters())) != len(list(self.parameters('all'))):
@@ -290,6 +296,7 @@ class SDFNetwork(nn.Module):
             lin = self.linear_layers[l]
             layer_is_scene_specific = type(lin) is not torch.nn.Linear
 
+            skip_connection = None
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
                 if self.scenewise_split_type == 'interleave_with_skips':
@@ -298,9 +305,13 @@ class SDFNetwork(nn.Module):
             if l in self.skip_in:
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
 
+            if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips_and_last' \
+                and self.dims[l] == self.dims[l + 1]:
+                skip_connection = x
+
             x = lin(x)
 
-            if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips':
+            if skip_connection is not None:
                 x += skip_connection
 
             if l < self.num_layers - 1:
@@ -451,6 +462,8 @@ class RenderingNetwork(nn.Module):
                 layer_is_scene_specific = l % 2 == 1
             elif scenewise_split_type == 'interleave_with_skips':
                 layer_is_scene_specific = l % 2 == 1 and in_dim == out_dim
+            elif scenewise_split_type == 'interleave_with_skips_and_last':
+                layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
             elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
@@ -479,6 +492,7 @@ class RenderingNetwork(nn.Module):
         self.relu = nn.ReLU()
 
         self.is_lowrank = scenewise_core_rank is not None
+        self.dims = dims
 
         # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
         if len(list(super().parameters())) != len(list(self.parameters('all'))):
@@ -510,14 +524,18 @@ class RenderingNetwork(nn.Module):
             lin = self.linear_layers[l]
             layer_is_scene_specific = type(lin) is not torch.nn.Linear
 
+            skip_connection = None
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
                 if self.scenewise_split_type == 'interleave_with_skips':
                     skip_connection = x
+                elif self.scenewise_split_type == 'interleave_with_skips_and_last' \
+                    and self.dims[l] == self.dims[l + 1]:
+                    skip_connection = x
 
             x = lin(x)
 
-            if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips':
+            if skip_connection is not None:
                 x += skip_connection
 
             if l < self.num_layers - 1:
