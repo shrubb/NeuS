@@ -779,6 +779,10 @@ class Runner:
                 self.dataset.scale_mats_np[scene_idx][0][:3, 3][None]
 
         mesh = trimesh.Trimesh(vertices, triangles, vertex_colors=vertex_colors)
+
+        if world_space and self.dataset.reg_mats_np is not None:
+            mesh.apply_transform(self.dataset.reg_mats_np[scene_idx][0])
+
         mesh.export(os.path.join(
             self.base_exp_dir, 'meshes', '{}_{:0>8d}.ply'.format(scene_idx, self.iter_step)))
 
