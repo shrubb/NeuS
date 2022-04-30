@@ -399,26 +399,23 @@ class Runner:
 
                 loss = 0
 
-                # Image loss
-                color_error = color_fine - true_rgb
+                # Image loss: L1
+                color_fine_error = (color_fine - true_rgb).abs()
                 if self.mask_weight > 0.0:
-                    color_error *= mask
-
-                color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum')
-                if self.mask_weight > 0.0:
-                    color_fine_loss /= mask_sum
+                    color_fine_error *= mask
+                    color_fine_loss = color_fine_error.sum() / mask_sum
                 else:
-                    color_fine_loss /= color_error.numel()
+                    color_fine_loss = color_fine_error.mean()
                 loss += color_fine_loss
 
                 psnr_train = psnr(color_fine, true_rgb, mask)
 
-                # Mask loss
+                # Mask loss: BCE
                 if self.mask_weight > 0.0:
-                    mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+                    mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
                     loss += mask_loss * self.mask_weight
 
-                # Eikonal loss
+                # SDF loss: eikonal
                 if self.igr_weight > 0:
                     # boolean mask, 1 if point is inside 1-sphere
                     relax_inside_sphere = render_out['relax_inside_sphere']
@@ -430,7 +427,7 @@ class Runner:
                         (relax_inside_sphere.sum() + 1e-5)
                     loss += eikonal_loss * self.igr_weight
 
-                # Radiance gradient loss
+                # Radiance loss: gradient orthogonality
                 if self.radiance_grad_weight > 0:
                     # dim 0: gradient of r/g/b
                     # dim 1: point number
@@ -780,8 +777,8 @@ class Runner:
 
         mesh = trimesh.Trimesh(vertices, triangles, vertex_colors=vertex_colors)
 
-        if world_space and self.dataset.reg_mats_np is not None:
-            mesh.apply_transform(self.dataset.reg_mats_np[scene_idx][0])
+        # if world_space and self.dataset.reg_mats_np is not None:
+        #     mesh.apply_transform(self.dataset.reg_mats_np[scene_idx][0])
 
         mesh.export(os.path.join(
             self.base_exp_dir, 'meshes', '{}_{:0>8d}.ply'.format(scene_idx, self.iter_step)))
