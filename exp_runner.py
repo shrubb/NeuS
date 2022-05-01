@@ -400,12 +400,11 @@ class Runner:
                 loss = 0
 
                 # Image loss: L1
-                color_fine_error = (color_fine - true_rgb).abs()
                 if self.mask_weight > 0.0:
-                    color_fine_error *= mask
-                    color_fine_loss = color_fine_error.sum() / mask_sum
+                    target_rgb = true_rgb * mask
                 else:
-                    color_fine_loss = color_fine_error.mean()
+                    target_rgb = true_rgb
+                color_fine_loss = (color_fine - target_rgb).abs().mean()
                 loss += color_fine_loss
 
                 psnr_train = psnr(color_fine, true_rgb, mask)
