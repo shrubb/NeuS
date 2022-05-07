@@ -1,25 +1,25 @@
 #!/bin/bash
 
-# Train a 'metamodel' or a single-scene model.
+# Train a 'metamodel' or a single-scene model. Or just run from arbitrary config.
 
-#SBATCH --job-name 134
+#SBATCH --job-name 100_rank50_gt1Linear100k_noDetach2
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 3-0
+#SBATCH --time 1-0
 
-#SBATCH -p gpu #_a100 #,gpu_devel
-#SBATCH --gres gpu:2
-#SBATCH --cpus-per-gpu 2
-#SBATCH --mem-per-gpu 70G
+#SBATCH -p gpu_a100
+#SBATCH --gres gpu:1
+#SBATCH --cpus-per-gpu 5
+#SBATCH --mem-per-gpu 72G
+
+##SBATCH --reservation egor.burkov_80
 
 #: '
 CONF=`mktemp`
-cp confs/gonzalo_100.conf $CONF1
+cp confs/gonzalo_100.conf $CONF
 
-PORT=25119
-NPROC=2
+PORT=25006
+NPROC=1
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
---conf $CONF
-#--checkpoint_path logs/100_rank50/checkpoints/ckpt_0110000.pth \
-#--extra_config_args 'general { base_exp_dir = ./logs/100_rank50_restart/ }, dataset { batch_size = ${train.batch_size} }, train { batch_size = 1024, learning_rate = 0.8e-3, warm_up_end = 1000 }'
+--conf $CONF --extra_config_args 'dataset { batch_size = ${train.batch_size} }, train { batch_size = 512 }'
 # '
 

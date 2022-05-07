@@ -432,7 +432,7 @@ class Runner:
                     # dim 1: point number
                     # dim 2: gradient over x/y/z
                     gradients_radiance = render_out['gradients_radiance'] # 3, K, 3
-                    gradients_eikonal_ = gradients_eikonal.detach()[None] # 1, K, 3
+                    gradients_eikonal_ = gradients_eikonal[None] # 1, K, 3
 
                     # We want these gradients to be orthogonal, so force dot product to zero
                     grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K

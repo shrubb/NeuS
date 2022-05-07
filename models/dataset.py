@@ -119,7 +119,7 @@ class Dataset(torch.utils.data.Dataset):
                 If 'val', will load the first and the last one (in the sorted list of filenames).
             """
             if images_to_pick == []:
-                return tuple([] for _ in range(7))
+                return tuple([] for _ in range(8))
 
             root_dir = pathlib.Path(root_dir)
 
@@ -160,7 +160,7 @@ class Dataset(torch.utils.data.Dataset):
 
             def read_mask(path):
                 retval = cv2.imread(str(path))
-                # retval = cv2.erode(retval, None, iterations=5, borderType=cv2.BORDER_REPLICATE)
+                # retval = cv2.erode(retval, None, iterations=2, borderType=cv2.BORDER_REPLICATE)
                 return torch.from_numpy(retval[..., 0])
             # [n_images, H, W, 1], uint8
             masks = torch.stack([read_mask(im_name) for im_name in masks_list])

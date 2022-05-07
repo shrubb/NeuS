@@ -327,7 +327,7 @@ class NeuSRenderer:
                 example_viewdir = rays_d[:1].expand(len(loss_pts), 3) # M, 3
                 assert loss_pts.requires_grad
                 loss_pts_radiance = color_network(
-                    loss_pts, loss_pts_sdf_grad.detach(), example_viewdir,
+                    loss_pts, loss_pts_sdf_grad, example_viewdir,
                     loss_pts_feature_vec, scene_idx) # M, 3
 
                 loss_pts_radiance_grad = []
