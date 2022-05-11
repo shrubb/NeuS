@@ -310,10 +310,16 @@ class Runner:
 
         if self.finetune:
             with torch.no_grad():
-                self.sdf_network.switch_to_finetuning(finetuning_init_algorithm)
-                self.color_network.switch_to_finetuning(finetuning_init_algorithm)
-                self.deviation_network.switch_to_finetuning(finetuning_init_algorithm)
-                self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm)
+                if finetuning_init_algorithm.startswith('pick'):
+                    scene_idx = int(finetuning_init_algorithm.split('_')[1])
+                    finetuning_init_algorithm = 'pick'
+                else:
+                    scene_idx = None
+
+                self.sdf_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
+                self.color_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
+                self.deviation_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
+                self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
 
         if not load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)

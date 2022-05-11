@@ -21,9 +21,24 @@ if __name__ == '__main__':
         ("e98bae39fad2244e", ["0011", "0000", "0064"]),
         ("f7e930d8a9ff2091", ["0009", "0000", "0065"]),
     ]
-    MODEL_NAME = "100_rank2000_smallLR_restart"
 
-    port = 25100
+    K = 0
+    KTH_MOST_SIMILAR_TRAIN_SCENE = {
+        '1b2a8613401e42a8': { 'left': 41, 'frontal': 91, 'right': 91, },
+        '3b5a2eb92a501d54': { 'left': 3, 'frontal': 3, 'right': 3, },
+        '444ea0dc5e85ee0b': { 'left': 95, 'frontal': 48, 'right': 17, },
+        '5ae021f2805c0854': { 'left': 16, 'frontal': 41, 'right': 47, },
+        '5cd49557ea450c89': { 'left': 4, 'frontal': 4, 'right': 4, },
+        '609cc60fd416e187': { 'left': 65, 'frontal': 41, 'right': 29, },
+        '7dd427509fe84baa': { 'left': 100, 'frontal': 100, 'right': 93, },
+        '868765907f66fd85': { 'left': 9, 'frontal': 31, 'right': 2, },
+        'e98bae39fad2244e': { 'left': 27, 'frontal': 99, 'right': 99, },
+        'f7e930d8a9ff2091': { 'left': 93, 'frontal': 4, 'right': 94, },
+    }
+
+    MODEL_NAME = "100_rank50_smallLR"
+
+    port = 25200
 
     for scene, images in SCENES:
         dataset_dir = pathlib.Path(f"./datasets/H3DS_processed/{scene}")
@@ -31,8 +46,8 @@ if __name__ == '__main__':
 
         for image, view_name in zip(images, VIEW_NAMES):
             experiment_name = f"{MODEL_NAME}_ftTo{scene[:4]}-1-{image}"
-            exp_dir = pathlib.Path(f"./logs-paper/h3ds/{MODEL_NAME}/{view_name}/{scene}-1-{image}")
-            if exp_dir.is_dir():
+            exp_dir = pathlib.Path(f"./logs-paper/h3ds/{MODEL_NAME}_initSimilar0/{view_name}/{scene}-1-{image}")
+            if exp_dir.is_dir() and not (exp_dir / "checkpoints/ckpt_0015000.pth").is_file():
                 print(f"Already exists, skipping: {exp_dir}")
                 port += 1
                 continue
@@ -45,9 +60,9 @@ f"""#!/bin/bash
 
 #SBATCH --job-name {experiment_name}
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 4:30:0
+#SBATCH --time 3:0:0
 
-#SBATCH -p gpu_a100 # res,htc,gpu,gpu_a100,gpu_devel
+#SBATCH -p gpu_a100,htc,gpu #,gpu_devel
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
@@ -67,7 +82,7 @@ PORT={port}
 NPROC=1
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path ./logs/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
---conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, ["{image}"]]], images_to_pick_val = [[0, ["{images[0]}", "{images[-1]}"]]], }}, train {{ validate_resolution_level = 1 }}'
+--conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, ["{image}"]]], images_to_pick_val = [[0, ["{images[0]}", "{images[-1]}"]]], }}, train {{ finetuning_init_algorithm = pick_{KTH_MOST_SIMILAR_TRAIN_SCENE[scene][view_name]}, validate_resolution_level = 1 }}'
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --conf $CONF2 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}'

@@ -130,7 +130,7 @@ class LowRankMultiLinear(nn.Module):
         """which_layers: 'all'/'scenewise'/'shared'
         """
         if self.finetuning:
-            assert scene_idx is None or scene_idx == 0 and len(self.combination_coeffs == 1)
+            assert scene_idx is None or scene_idx == 0 and len(self.combination_coeffs) == 1
 
         if which_layers == 'all':
             return super().parameters()
@@ -337,7 +337,7 @@ class SDFNetwork(nn.Module):
                 only_inputs=True)[0]
             return gradients, sdf, feature_vector
 
-    def switch_to_finetuning(self, algorithm='pick'):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -345,7 +345,7 @@ class SDFNetwork(nn.Module):
         algorithm
             str
             One of:
-            - pick (take the 0th scene's 'subnetwork')
+            - pick (take the `scene_idx`-th scene's 'subnetwork')
             - average (average weight tensors over all scenes)
         """
         for i in range(self.num_layers):
@@ -353,7 +353,7 @@ class SDFNetwork(nn.Module):
 
             if layer_type is nn.ModuleList:
                 if algorithm == 'pick':
-                    new_layer = self.linear_layers[i][0]
+                    new_layer = self.linear_layers[i][scene_idx]
                 elif algorithm == 'average':
                     new_layer = self.linear_layers[i][0]
                     for param_name, _ in new_layer.named_parameters():
@@ -366,7 +366,7 @@ class SDFNetwork(nn.Module):
                 self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
-                self.linear_layers[i].switch_to_finetuning(algorithm)
+                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
@@ -569,7 +569,7 @@ class RenderingNetwork(nn.Module):
             # dim 2: gradient over x/y/z
             return torch.stack(gradients) # 3, K, 3
 
-    def switch_to_finetuning(self, algorithm='pick'):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -577,7 +577,7 @@ class RenderingNetwork(nn.Module):
         algorithm
             str
             One of:
-            - pick (take the 0th scene's 'subnetwork')
+            - pick (take the `scene_idx`-th scene's 'subnetwork')
             - average (average weight tensors over all scenes)
         """
         for i in range(self.num_layers):
@@ -585,7 +585,7 @@ class RenderingNetwork(nn.Module):
 
             if layer_type is nn.ModuleList:
                 if algorithm == 'pick':
-                    new_layer = self.linear_layers[i][0]
+                    new_layer = self.linear_layers[i][scene_idx]
                 elif algorithm == 'average':
                     new_layer = self.linear_layers[i][0]
                     for param_name, _ in new_layer.named_parameters():
@@ -598,7 +598,7 @@ class RenderingNetwork(nn.Module):
                 self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
-                self.linear_layers[i].switch_to_finetuning(algorithm)
+                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx)
 
                 # If we wanted to compute weights and revert to a regular `Linear` layer:
                 # if type(self.linear_layers[i]) is LowRankMultiLinear:
@@ -727,7 +727,7 @@ class MultiSceneNeRF(nn.ModuleList):
     def __init__(self, n_scenes, *args, **kwargs):
         super().__init__([NeRF(*args, **kwargs) for _ in range(n_scenes)])
 
-    def switch_to_finetuning(self, algorithm='pick'):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -735,8 +735,10 @@ class MultiSceneNeRF(nn.ModuleList):
         algorithm
             str
             One of:
-            - pick (take the 0th scene's 'subnetwork')
+            - pick (take the `scene_idx`-th scene's 'subnetwork')
             - average (same as 'pick' because we don't use background in finetuning anyway)
+
+            Arguments have no effect: always works like it's algorithm=='pick' and scene_idx==0.
         """
         if algorithm in ('pick', 'average'):
             super().__init__([self[0]])
@@ -784,7 +786,7 @@ class SingleVarianceNetwork(nn.Module):
         with torch.no_grad():
             self.variance.fill_(init_val)
 
-    def switch_to_finetuning(self, algorithm=None):
+    def switch_to_finetuning(self, algorithm=None, scene_idx=None):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
