@@ -6,7 +6,7 @@ python3 eval_mesh.py \
 
 
 # compute chamfer distance
-for model_name in 100_rank10_smallLR_newMaskLoss; do
+for model_name in 100_rank50_smallLR_initSimilar0; do
 for view in frontal left right; do
 for scene_id in 1b2a8613401e42a8 3b5a2eb92a501d54 444ea0dc5e85ee0b 5ae021f2805c0854 5cd49557ea450c89 609cc60fd416e187 7dd427509fe84baa 868765907f66fd85 e98bae39fad2244e f7e930d8a9ff2091; do
 
@@ -16,10 +16,10 @@ exp_dir=`echo logs-paper/h3ds/${model_name}/${view}/${scene_id}*`
 # python3 apply_transform_to_mesh_from_h3dnet.py --mesh $m --scene_id ${scene_id} --output $m
 # done
 
-srun -c 2 -t 0:10:0 -p cpu,mem,gpu,gpu_devel,res,htc,gpu_a100 python3 eval_mesh.py \
+srun -c 2 -t 0:10:0 -p cpu,mem,gpu,gpu_devel,htc,gpu_a100 python3 eval_mesh.py \
 --mesh `ls -1d ${exp_dir}/meshes/* | tail -n 1` \
 --scene_id ${scene_id} > ${exp_dir}/eval_mesh_${scene_id}.txt 2>&1 &
-srun -c 2 -t 0:10:0 -p cpu,mem,gpu,gpu_devel,res,htc,gpu_a100 python3 eval_mesh.py \
+srun -c 2 -t 0:10:0 -p cpu,mem,gpu,gpu_devel,htc,gpu_a100 python3 eval_mesh.py \
 --mesh `ls -1d ${exp_dir}/meshes/* | head -n 1` \
 --scene_id ${scene_id} > ${exp_dir}/eval_mesh_scenewiseOnly_${scene_id}.txt 2>&1 &
 
@@ -28,7 +28,7 @@ done
 done
 
 # print chamfer distance
-for model_name in 100_rank10_smallLR_newMaskLoss; do
+for model_name in 100_rank50_smallLR_initSimilar0; do
 for ft_mode in scenewise full; do
 for view in frontal left right; do
 for scene_id in 1b2a8613401e42a8 3b5a2eb92a501d54 444ea0dc5e85ee0b 5ae021f2805c0854 5cd49557ea450c89 609cc60fd416e187 7dd427509fe84baa 868765907f66fd85 e98bae39fad2244e f7e930d8a9ff2091; do

@@ -103,7 +103,7 @@ class Dataset(torch.utils.data.Dataset):
                 else:
                     images_to_pick_per_scene[scene_idx] += image_names
 
-        render_cameras_name = conf.get_string('render_cameras_name')
+        render_cameras_name = conf.get_string('render_cameras_name', default="cameras_sphere.npz")
 
         def load_one_scene(
             root_dir: pathlib.Path, images_to_pick: List[str] = 'default', kind: str = 'train'):
