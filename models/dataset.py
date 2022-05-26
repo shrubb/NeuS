@@ -18,6 +18,9 @@ import pickle
 import multiprocessing
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
+from utils.camera import se3_to_SE3, compose
+
+
 def load_K_Rt_from_P(filename, P=None):
     if P is None:
         lines = open(filename).read().splitlines()
@@ -198,10 +201,11 @@ class Dataset(torch.utils.data.Dataset):
         all_data = [load_one_scene(data_dir, images_to_pick, kind=kind) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
-        self.images, self.masks, self.pose_all, self.intrinsics_all, \
+        self.images, self.masks, pose_all_init, self.intrinsics_all, \
             self.scale_mats_np, self.reg_mats_np, self.focal, self.object_bboxes = zip(*all_data)
 
-        self.pose_all = [x.to(self.device) if x != [] else [] for x in self.pose_all]
+        self.pose_all_init = [x.to(self.device) if x != [] else [] for x in pose_all_init]
+        self.se3_refine = [torch.zeros(1, 6, device=self.device, dtype=x.dtype) if x != [] else [] for x in pose_all_init]
         self.intrinsics_all = [x.to(self.device) if x != [] else [] for x in self.intrinsics_all]
         self.intrinsics_all_inv = [torch.inverse(x) if x != [] else [] for x in self.intrinsics_all]
 
@@ -216,6 +220,11 @@ class Dataset(torch.utils.data.Dataset):
         self.object_bbox_max = np.float32([ 1.01,  1.01,  1.01])
 
         logging.info('Load data: End')
+
+    @property
+    def pose_all(self):
+        final = [compose([se3_to_SE3(self.se3_refine[i]), x[:, :3]]) if x != [] else [] for i, x in enumerate(self.pose_all_init)]
+        return final
 
     def __len__(self):
         return self.num_scenes
