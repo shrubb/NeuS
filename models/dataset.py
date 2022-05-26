@@ -207,7 +207,7 @@ class Dataset(torch.utils.data.Dataset):
         self.pose_all_init = [x.to(self.device) if x != [] else [] for x in pose_all_init]
         self.se3_refine = [torch.zeros(1, 6, device=self.device, dtype=x.dtype) if x != [] else [] for x in pose_all_init]
         self.intrinsics_all_init = [x.to(self.device) if x != [] else [] for x in intrinsics_all_init]
-        self.log_focus_correction = [torch.zeros(2, device=self.device, dtype=x.dtype) if x != [] else [] for x in intrinsics_all_init]
+        self.log_focus_correction = [torch.zeros(1, device=self.device, dtype=x.dtype) if x != [] else [] for x in intrinsics_all_init]
 
         self.H, self.W = next(filter(lambda x: x != [], self.images)).shape[1:3]
         self.image_pixels = self.H * self.W
@@ -223,12 +223,12 @@ class Dataset(torch.utils.data.Dataset):
 
     def create_focus_correction(self, log_focus_correction):
         """
-            focus_correction (torch.tensor): of size (2,)
+            log_focus_correction (torch.tensor): of size (1,)
         """
         m = torch.ones(1, 4, 4, device=log_focus_correction.device, dtype=log_focus_correction.dtype)
         focus_correction = torch.exp(log_focus_correction)
-        m[:, 0, 0] = m[:, 0, 0] * focus_correction[0]
-        m[:, 1, 1] = m[:, 1, 1] * focus_correction[1]
+        m[:, 0, 0] = m[:, 0, 0] * focus_correction
+        m[:, 1, 1] = m[:, 1, 1] * focus_correction
         return m
 
     @property
