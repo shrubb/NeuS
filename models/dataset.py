@@ -201,13 +201,13 @@ class Dataset(torch.utils.data.Dataset):
         all_data = [load_one_scene(data_dir, images_to_pick, kind=kind) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
-        self.images, self.masks, pose_all_init, self.intrinsics_all, \
+        self.images, self.masks, pose_all_init, intrinsics_all_init, \
             self.scale_mats_np, self.reg_mats_np, self.focal, self.object_bboxes = zip(*all_data)
 
         self.pose_all_init = [x.to(self.device) if x != [] else [] for x in pose_all_init]
         self.se3_refine = [torch.zeros(1, 6, device=self.device, dtype=x.dtype) if x != [] else [] for x in pose_all_init]
-        self.intrinsics_all = [x.to(self.device) if x != [] else [] for x in self.intrinsics_all]
-        self.intrinsics_all_inv = [torch.inverse(x) if x != [] else [] for x in self.intrinsics_all]
+        self.intrinsics_all_init = [x.to(self.device) if x != [] else [] for x in intrinsics_all_init]
+        self.log_focus_correction = [torch.zeros(2, device=self.device, dtype=x.dtype) if x != [] else [] for x in intrinsics_all_init]
 
         self.H, self.W = next(filter(lambda x: x != [], self.images)).shape[1:3]
         self.image_pixels = self.H * self.W
@@ -220,6 +220,24 @@ class Dataset(torch.utils.data.Dataset):
         self.object_bbox_max = np.float32([ 1.01,  1.01,  1.01])
 
         logging.info('Load data: End')
+
+    def create_focus_correction(self, log_focus_correction):
+        """
+            focus_correction (torch.tensor): of size (2,)
+        """
+        m = torch.ones(1, 4, 4, device=log_focus_correction.device, dtype=log_focus_correction.dtype)
+        focus_correction = torch.exp(log_focus_correction)
+        m[:, 0, 0] = m[:, 0, 0] * focus_correction[0]
+        m[:, 1, 1] = m[:, 1, 1] * focus_correction[1]
+        return m
+
+    @property
+    def intrinsics_all(self):
+        return [x * self.create_focus_correction(self.log_focus_correction[i]) if x != [] else [] for i, x in enumerate(self.intrinsics_all_init)]
+
+    @property
+    def intrinsics_all_inv(self):
+        return [torch.inverse(x) if x != [] else [] for x in self.intrinsics_all]
 
     @property
     def pose_all(self):
