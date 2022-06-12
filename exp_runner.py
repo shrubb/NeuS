@@ -4,6 +4,7 @@ from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF
 from models.renderer import NeuSRenderer
 
+import torch.nn as nn
 import cv2
 import numpy as np
 import trimesh
@@ -120,6 +121,16 @@ class Runner:
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'], kind='train')
         self.dataset_val = Dataset(self.conf['dataset'], kind='val')
+
+        log_focus_correction = []
+        for i in range(len(self.dataset.log_focus_correction)):
+            if self.dataset.log_focus_correction[i] == []:
+                log_focus_correction.append([])
+            else:
+                log_focus_correction.append(nn.Parameter(self.dataset.log_focus_correction[i]))
+        log_focus_correction = nn.ParameterList(log_focus_correction)
+        for i in range(len(self.dataset.log_focus_correction)):
+            self.dataset.log_focus_correction[i] = log_focus_correction[i]
 
         logging.info(f"Experiment dir: {self.base_exp_dir}")
 
