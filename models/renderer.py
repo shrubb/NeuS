@@ -116,6 +116,7 @@ class NeuSRenderer:
         dirs = dirs.reshape(-1, 3)
 
         density, sampled_color = nerf(pts, dirs)
+        sampled_color = torch.sigmoid(sampled_color)
         alpha = 1.0 - torch.exp(-F.softplus(density.reshape(batch_size, n_samples)) * dists)
         alpha = alpha.reshape(batch_size, n_samples)
         wtf = torch.cat([torch.ones([batch_size, 1], device=alpha.device), 1. - alpha + 1e-7], -1)
