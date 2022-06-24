@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
 from models.embedder import get_embedder
+import utils.camera
 
 import logging
 
@@ -796,3 +798,51 @@ class SingleVarianceNetwork(nn.Module):
             No effect. For compatibility only.
         """
         pass # self.reset_parameters_(0.365)
+
+class TrainableCameraParams(nn.Module):
+    """
+    Trainable correction for `num_cameras` sets of camera parameters.
+    Intrinsics are shared between cameras (so only 1 matrix for all cameras is learned).
+    1 trainable parameter for intrinsics (focal distance multiplicative delta)
+    and 6 for extrinsics (se(3) correction = 3 translation amounts + 3 rotation angles).
+    """
+    def __init__(self, num_cameras):
+        super().__init__()
+        self.log_focal_dist_delta = nn.Parameter(torch.zeros([]))
+        self.pose_se3_delta = nn.Parameter(torch.zeros(num_cameras, 6))
+
+    def apply_params_correction(self, camera_idx, intrinsics_init, pose_init):
+        """
+        camera_idx
+            int
+        intrinsics_init
+            torch.FloatTensor, shape == (4, 4)
+        pose_init
+            torch.FloatTensor, shape == (4, 4)
+
+        return:
+        intrinsics_new
+        pose_new
+            torch.FloatTensor, shape == (4, 4)
+            The above set of camera parameters but with trainable corrections applied.
+        """
+        intrinsics_new = intrinsics_init.clone()
+        focal_dist_delta = self.log_focal_dist_delta.exp()
+        intrinsics_new[0, 0] *= focal_dist_delta
+        intrinsics_new[1, 1] *= focal_dist_delta
+
+        pose_SE3_delta = utils.camera.se3_to_SE3(self.pose_se3_delta[camera_idx])
+        pose_new = utils.camera.compose([pose_SE3_delta, pose_init[:3, :4]])
+
+        return intrinsics_new, pose_new
+
+    def parameters(self, which_layers='all', scene_idx=None):
+        """which_layers: no effect
+        """
+        if which_layers in ('all', 'scenewise'):
+            assert scene_idx is None or scene_idx == 0
+            return list(super().parameters())
+        elif which_layers == 'shared':
+            return []
+        else:
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")

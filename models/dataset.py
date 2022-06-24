@@ -75,7 +75,13 @@ def load_camera_matrices(path):
 
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, conf, kind='train'):
+    def __init__(self, conf, kind='train', return_cameras_only=False):
+        """
+        If `return_cameras_only == False`, will return ray points (as usual),
+            sampling pixels from `NUM_IMAGES_TO_USE` images.
+        If `return_cameras_only == True`, will return camera parameters only,
+            for ONE image.
+        """
         super(Dataset, self).__init__()
         logging.info('Load data: Begin')
         self.device = torch.device('cpu')
@@ -85,6 +91,9 @@ class Dataset(torch.utils.data.Dataset):
         self.data_dirs = conf.get_list('data_dirs')
         self.num_scenes = len(self.data_dirs)
         self.batch_size = conf.get_int('batch_size')
+        self.return_cameras_only = return_cameras_only
+        if self.return_cameras_only and self.num_scenes > 1:
+            raise NotImplementedError("Optimizing cameras for multiple scenes is NYI")
 
         # Format for `images_to_pick[_val]` in config:
         # [[0, ["00747", "00889"]], [2, ["00053"]], ...]
@@ -279,7 +288,8 @@ class Dataset(torch.utils.data.Dataset):
 
     def gen_rays_at(self, scene_idx, image_idx, resolution_level=1):
         """
-        Generate rays at world space from one camera.
+        Compute coordinates of points on camera rays
+        that correspond to all pixels (i.e. entire rectangular image) in one camera.
         """
         l, t, r, b = self.object_bboxes[scene_idx][image_idx]
         # Round to resolution_level grid
@@ -306,12 +316,35 @@ class Dataset(torch.utils.data.Dataset):
 
     def gen_random_rays_at(self, batch_size, scene_idx, image_idx=None):
         """
-        Generate random rays at world space from one camera.
+        Compute coordinates of points on camera rays
+        that correspond to random pixels in random camera(s).
 
         image_idx:
             None or int
-            If None, sample from 8 random images in scene `scene_idx`.
+            If None, sample from `NUM_IMAGES_TO_USE` random images in scene `scene_idx`.
         """
+        if self.return_cameras_only:
+            num_images_in_scene = len(self.images[scene_idx])
+            image_idx = random.randint(0, num_images_in_scene - 1)
+
+            # TODO refactor with the chunk below to remove this repetitive code
+            rgb, mask = self.get_image_and_mask(scene_idx, image_idx)
+            l, t, r, b = self.object_bboxes[scene_idx][image_idx]
+
+            pixels_x = torch.randint(
+                low=l, high=r, size=[batch_size])
+            pixels_y = torch.randint(
+                low=t, high=b, size=[batch_size])
+
+            rgb = rgb[(pixels_y, pixels_x)]    # batch_size, 3
+            mask = mask[(pixels_y, pixels_x)]  # batch_size, 1
+            pixels = torch.stack([pixels_x, pixels_y], dim=-1).float()
+
+            camera_extrinsics = self.pose_all[scene_idx][image_idx] # 4, 4
+            camera_intrinsics = self.intrinsics_all[scene_idx][image_idx]
+
+            return camera_intrinsics, camera_extrinsics, pixels, rgb, mask
+
         remaining_rays_to_sample = batch_size
 
         # Determine which images to use

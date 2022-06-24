@@ -1,7 +1,8 @@
 from typing import List
 
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF
+from models.fields import \
+    RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF, TrainableCameraParams
 from models.renderer import NeuSRenderer
 
 import cv2
@@ -118,8 +119,14 @@ class Runner:
         assert self.base_exp_dir is not None, "'base_exp_dir' not defined anywhere"
 
         os.makedirs(self.base_exp_dir, exist_ok=True)
-        self.dataset = Dataset(self.conf['dataset'], kind='train')
-        self.dataset_val = Dataset(self.conf['dataset'], kind='val')
+
+        # TODO remove
+        self.optimize_cameras = True
+
+        self.dataset = Dataset(self.conf['dataset'], kind='train',
+            return_cameras_only=self.optimize_cameras)
+        self.dataset_val = Dataset(self.conf['dataset'], kind='val',
+            return_cameras_only=self.optimize_cameras)
 
         logging.info(f"Experiment dir: {self.base_exp_dir}")
 
@@ -140,6 +147,8 @@ class Runner:
         self.learning_rate_reduce_factor = self.conf.get_float('train.learning_rate_reduce_factor')
         self.scenewise_layers_optimizer_extra_args = \
             dict(self.conf.get('train.scenewise_layers_optimizer_extra_args', default={}))
+        self.cameras_optimizer_extra_args = \
+            dict(self.conf.get('train.cameras_optimizer_extra_args', default={}))
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
@@ -152,8 +161,17 @@ class Runner:
             del self.conf['train']['restart_from_iter']
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
-        parts_to_train = \
-            self.conf.get_list('train.parts_to_train', default=[])
+        PARTS_TO_TRAIN_ALL = set(['nerf_outside', 'sdf', 'deviation', 'color', 'cameras'])
+        if 'train.parts_to_freeze' in self.conf:
+            parts_to_freeze = self.conf.get_list('train.parts_to_freeze', default=['cameras'])
+            for x in parts_to_freeze:
+                assert x in PARTS_TO_TRAIN_ALL, f"Invalid 'train.parts_to_freeze': {x}"
+            parts_to_train = PARTS_TO_TRAIN_ALL - set(parts_to_freeze)
+        else: # backward compatibility
+            parts_to_train = self.conf.get_list('train.parts_to_train',
+                default=PARTS_TO_TRAIN_ALL - ['cameras'])
+        logging.info(f"Will optimize only these parts: {parts_to_train}")
+
         load_optimizer = \
             self.conf.get_bool('train.load_optimizer', default=not self.finetune)
         parts_to_skip_loading = \
@@ -180,18 +198,19 @@ class Runner:
         self.model_list = []
         self.writer = None
 
-        # Networks
+        # Trainable networks and modules
         current_num_scenes = self.conf.get_int('dataset.original_num_scenes', default=self.dataset.num_scenes)
         self.nerf_outside = MultiSceneNeRF(**self.conf['model.nerf'], n_scenes=current_num_scenes).to(self.device)
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=current_num_scenes).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
+        self.trainable_camera_params = TrainableCameraParams(self.dataset.num_scenes).to(self.device)
 
         def get_optimizer(parts_to_train):
             """
             parts_to_train:
-                list of str
-                If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
+                iterable of str
+                Valid strings: 'nerf_outside', 'sdf', 'deviation', 'color', 'cameras'.
             """
             class ScenePickingAdam(apex.optimizers.FusedAdam):
                 @contextlib.contextmanager
@@ -217,15 +236,10 @@ class Runner:
                     finally:
                         self.param_groups = all_param_groups
 
-            if parts_to_train == []:
-                parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
-            else:
-                logging.warning(f"Will optimize only these parts: {parts_to_train}")
-
             if self.scenewise_layers_optimizer_extra_args:
                 logging.warning(
                     f"There are 'scenewise_layers_optimizer_extra_args'. " \
-                    f"Will not apply them to bkgd NeRF: " \
+                    f"Will not apply them to bkgd NeRF and cameras: " \
                     f"{self.scenewise_layers_optimizer_extra_args}")
 
             def get_module_to_train(part_name):
@@ -237,6 +251,8 @@ class Runner:
                     return self.deviation_network
                 elif part_name == 'color':
                     return self.color_network
+                elif part_name == 'cameras':
+                    return self.trainable_camera_params
                 else:
                     raise ValueError(f"Unknown 'parts_to_train': {part_name}")
 
@@ -279,7 +295,7 @@ class Runner:
                         'params': tensors_to_train,
                         'base_learning_rate': self.base_learning_rate}
 
-                    if part_name != 'nerf_outside':
+                    if part_name not in ('nerf_outside', 'cameras'):
                         parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
 
                     parameter_groups.append(parameter_group_settings)
@@ -287,6 +303,13 @@ class Runner:
             logging.info(
                 f"Got {total_tensors} trainable SCENEWISE tensors " \
                 f" ({total_parameters} parameters total)")
+
+            if self.cameras_optimizer_extra_args:
+                logging.info(f"Will optimize cameras with: {self.cameras_optimizer_extra_args}")
+
+                for parameter_group_settings in parameter_groups:
+                    if parameter_group_settings['group_name'].startswith('cameras-'):
+                        parameter_group_settings.update(self.cameras_optimizer_extra_args)
 
             return ScenePickingAdam(parameter_groups)
 
@@ -372,15 +395,32 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
 
-            scene_idx, (rays_o, rays_d, true_rgb, mask, near, far) = next(data_loader)
+            if self.optimize_cameras:
+                scene_idx, (camera_intrinsics, camera_extrinsics, pixels, true_rgb, mask) = next(data_loader)
 
-            rays_o = rays_o.cuda()
-            rays_d = rays_d.cuda()
-            true_rgb = true_rgb.cuda()
-            mask = mask.cuda()
-            near = near.cuda()
-            far = far.cuda()
-            # ZERO = torch.zeros(1, 1).cuda()
+                pixels = pixels.to(self.device)
+                camera_extrinsics = camera_extrinsics.to(self.device) # 4, 4
+                camera_intrinsics = camera_intrinsics.to(self.device) # 4, 4
+
+                camera_intrinsics, camera_extrinsics = \
+                    self.trainable_camera_params.apply_params_correction(
+                        scene_idx, camera_intrinsics, camera_extrinsics)
+                camera_intrinsics_inv = torch.inverse(camera_intrinsics)
+
+                rays_o, rays_d = self.dataset.gen_rays(
+                    pixels, camera_extrinsics[:3, :4], camera_intrinsics_inv[:3, :3],
+                    self.dataset.H, self.dataset.W)
+                near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+            else:
+                scene_idx, (rays_o, rays_d, true_rgb, mask, near, far) = next(data_loader)
+
+            rays_o = rays_o.to(self.device)
+            rays_d = rays_d.to(self.device)
+            true_rgb = true_rgb.to(self.device)
+            mask = mask.to(self.device)
+            near = near.to(self.device)
+            far = far.to(self.device)
+            # ZERO = torch.zeros(1, 1).to(self.device)
 
             mask_sum = mask.sum() + 1e-5
 
@@ -479,6 +519,11 @@ class Runner:
                     self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
                     self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
                     self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
+                    if self.optimize_cameras:
+                        self.writer.add_scalar('Statistics/Focal distance correction 0',
+                            self.trainable_camera_params.log_focal_dist_delta.exp(), self.iter_step)
+                        self.writer.add_scalar('Statistics/Camera se(3) correction (abs max)',
+                            self.trainable_camera_params.pose_se3_delta.abs().max(), self.iter_step)
 
                     if self.iter_step % self.report_freq == 0:
                         print(self.base_exp_dir)
@@ -575,6 +620,9 @@ class Runner:
             load_weights(self.deviation_network, checkpoint['variance_network_fine'])
         if 'color' not in parts_to_skip_loading:
             load_weights(self.color_network, checkpoint['color_network_fine'])
+        if 'cameras' not in parts_to_skip_loading:
+            if 'trainable_camera_params' in checkpoint:
+                load_weights(self.trainable_camera_params, checkpoint['trainable_camera_params'])
 
         if load_optimizer:
             # Don't let overwrite custom keys
@@ -604,6 +652,7 @@ class Runner:
             'sdf_network_fine': self.sdf_network.state_dict(),
             'variance_network_fine': self.deviation_network.state_dict(),
             'color_network_fine': self.color_network.state_dict(),
+            'trainable_camera_params': self.trainable_camera_params.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'iter_step': self.iter_step,
             'config': self.conf,
@@ -631,10 +680,10 @@ class Runner:
                     val_scene_idx, val_image_idx, resolution_level=resolution_level)
 
                 H, W, _ = rays_o.shape
-                rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
-                rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
-                near = near.cuda().reshape(-1, 1).split(self.batch_size)
-                far = far.cuda().reshape(-1, 1).split(self.batch_size)
+                rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
+                rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
+                near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
+                far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
 
                 out_rgb_fine = []
                 out_normal_fine = []
@@ -708,10 +757,10 @@ class Runner:
         rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
             scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
-        rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
-        rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
-        near = near.cuda().reshape(-1, 1).split(self.batch_size)
-        far = far.cuda().reshape(-1, 1).split(self.batch_size)
+        rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
+        rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
+        near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
+        far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
 
         rgb_all = []
         normals_all = []
