@@ -193,6 +193,7 @@ class Runner:
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight', default=0.0)
         self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0.0)
+        self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight')
 
         self.mode = args.mode
         self.model_list = []
@@ -487,6 +488,10 @@ class Runner:
                     #     grads_dot_product, ZERO.expand_as(grads_dot_product))
                     loss += radiance_grad_loss * self.radiance_grad_weight
 
+                if self.focal_fix_weight > 0:
+                    focal_fix_loss = (self.trainable_camera_params.log_focal_dist_delta ** 2).mean()
+                    loss += focal_fix_loss * self.focal_fix_weight
+
             # These values are only needed for logging
             learning_rate_shared, learning_rate_scenewise = self.update_learning_rate()
             self.optimizer.zero_grad()
@@ -534,6 +539,33 @@ class Runner:
 
                     if self.iter_step % self.val_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                         self.validate_images()
+
+                        if self.optimize_cameras:
+                            # Display camera positions
+                            camera_intrinsics = self.dataset.intrinsics_all[0][0].to(self.device)
+                            camera_extrinsics_all = []
+
+                            for camera_extrinsics in self.dataset.pose_all[0].to(self.device):
+                                current_intrinsics, current_extrinsics = \
+                                    self.trainable_camera_params.apply_params_correction(
+                                        0, camera_intrinsics, camera_extrinsics)
+                                camera_extrinsics_all.append(current_extrinsics)
+
+                            camera_extrinsics_all = torch.stack(camera_extrinsics_all)
+                            # self.writer.add_mesh(
+                            #     'Statistics/Cameras', camera_extrinsics_all[None, :3, 3],
+                            #     config_dict={
+                            #         'material': {
+                            #             'cls': 'PointsMaterial',
+                            #             'size': 0.1
+                            #     }},
+                            #     global_step=self.iter_step)
+                            cameras_save_dir = os.path.join(self.base_exp_dir, "cameras")
+                            os.makedirs(cameras_save_dir, exist_ok=True)
+                            torch.save({
+                                'intrinsics': current_intrinsics,
+                                'extrinsics': camera_extrinsics_all,
+                            }, os.path.join(cameras_save_dir, f"{self.iter_step:07}.pth")
 
                     if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                         self.validate_mesh(

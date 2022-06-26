@@ -93,7 +93,8 @@ class Dataset(torch.utils.data.Dataset):
         self.batch_size = conf.get_int('batch_size')
         self.return_cameras_only = return_cameras_only
         if self.return_cameras_only and self.num_scenes > 1:
-            raise NotImplementedError("Optimizing cameras for multiple scenes is NYI")
+            raise NotImplementedError(
+                f"Optimizing cameras for multiple scenes ({self.num_scenes}) is NYI")
 
         # Format for `images_to_pick[_val]` in config:
         # [[0, ["00747", "00889"]], [2, ["00053"]], ...]
