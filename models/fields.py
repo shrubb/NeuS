@@ -176,6 +176,11 @@ class SDFNetwork(nn.Module):
             - 'prepend_half'
             - 'replace_last_half'
             - 'replace_first_half'
+            - 'radiance_only'
+            - 'sdf_only'
+            - 'replace_first_half_sdf_only'
+            - 'replace_first_half_radiance_only'
+            - 'all'
         """
         super().__init__()
 
@@ -183,7 +188,7 @@ class SDFNetwork(nn.Module):
         if scenewise_split_type in ('append_half', 'prepend_half'):
             num_scene_specific_layers = (n_layers + 1) // 2
             n_layers += num_scene_specific_layers
-        elif scenewise_split_type in ('replace_last_half', 'replace_first_half'):
+        elif scenewise_split_type in ('replace_last_half', 'replace_first_half', 'replace_first_half_sdf_only'):
             num_scene_specific_layers = (n_layers + 1) // 2
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
@@ -215,9 +220,13 @@ class SDFNetwork(nn.Module):
             elif scenewise_split_type == 'interleave_with_skips_and_last':
                 layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
-                layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
-            elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
+                layer_is_scene_specific = self.num_layers - num_scene_specific_layers <= l < self.num_layers - 1
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_sdf_only'):
                 layer_is_scene_specific = l < num_scene_specific_layers
+            elif scenewise_split_type in ('sdf_only', 'all'):
+                layer_is_scene_specific = l < self.num_layers - 1
+            elif scenewise_split_type in ('radiance_only', 'replace_first_half_radiance_only'):
+                layer_is_scene_specific = False
             else:
                 raise ValueError(
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
@@ -251,6 +260,7 @@ class SDFNetwork(nn.Module):
                 return layer
 
             if layer_is_scene_specific:
+                logging.info(f"SDF: layer {l} is scene-specific")
                 if scenewise_core_rank is None:
                     lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 else:
@@ -434,7 +444,7 @@ class RenderingNetwork(nn.Module):
         if scenewise_split_type in ('append_half', 'prepend_half'):
             num_scene_specific_layers = (n_layers + 1) // 2
             n_layers += num_scene_specific_layers
-        elif scenewise_split_type in ('replace_last_half', 'replace_first_half'):
+        elif scenewise_split_type in ('replace_last_half', 'replace_first_half', 'replace_first_half_radiance_only'):
             num_scene_specific_layers = (n_layers + 1) // 2
 
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
@@ -468,13 +478,18 @@ class RenderingNetwork(nn.Module):
                 layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
-            elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_radiance_only'):
                 layer_is_scene_specific = l < num_scene_specific_layers
+            elif scenewise_split_type in ('sdf_only', 'replace_first_half_sdf_only'):
+                layer_is_scene_specific = False
+            elif scenewise_split_type in ('radiance_only', 'all'):
+                layer_is_scene_specific = True
             else:
                 raise ValueError(
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
 
             if layer_is_scene_specific:
+                logging.info(f"Radiance: layer {l} is scene-specific")
                 if scenewise_core_rank is None:
                     lin = nn.ModuleList(
                         [maybe_weight_norm(nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
