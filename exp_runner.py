@@ -121,7 +121,9 @@ class Runner:
         os.makedirs(self.base_exp_dir, exist_ok=True)
 
         # TODO remove
-        self.optimize_cameras = True
+        self.optimize_cameras = not 'cameras' in self.conf.get_list(
+            'train.parts_to_freeze', default=['cameras'])
+        logging.info(f"optimize_cameras is {self.optimize_cameras}")
 
         self.dataset = Dataset(self.conf['dataset'], kind='train',
             return_cameras_only=self.optimize_cameras)
@@ -169,7 +171,7 @@ class Runner:
             parts_to_train = PARTS_TO_TRAIN_ALL - set(parts_to_freeze)
         else: # backward compatibility
             parts_to_train = self.conf.get_list('train.parts_to_train',
-                default=PARTS_TO_TRAIN_ALL - ['cameras'])
+                default=PARTS_TO_TRAIN_ALL - set(['cameras']))
         logging.info(f"Will optimize only these parts: {parts_to_train}")
 
         load_optimizer = \
@@ -205,7 +207,7 @@ class Runner:
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=current_num_scenes).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
-        self.trainable_camera_params = TrainableCameraParams(self.dataset.num_scenes).to(self.device)
+        self.trainable_camera_params = TrainableCameraParams([len(images) for images in self.dataset.images]).to(self.device)
 
         def get_optimizer(parts_to_train):
             """
@@ -397,7 +399,8 @@ class Runner:
             start_time = time.time()
 
             if self.optimize_cameras:
-                scene_idx, (camera_intrinsics, camera_extrinsics, pixels, true_rgb, mask) = next(data_loader)
+                scene_idx, (image_idx, camera_intrinsics, camera_extrinsics, \
+                    pixels, true_rgb, mask) = next(data_loader)
 
                 pixels = pixels.to(self.device)
                 camera_extrinsics = camera_extrinsics.to(self.device) # 4, 4
@@ -405,7 +408,7 @@ class Runner:
 
                 camera_intrinsics, camera_extrinsics = \
                     self.trainable_camera_params.apply_params_correction(
-                        scene_idx, camera_intrinsics, camera_extrinsics)
+                        scene_idx, image_idx, camera_intrinsics, camera_extrinsics)
                 camera_intrinsics_inv = torch.inverse(camera_intrinsics)
 
                 rays_o, rays_d = self.dataset.gen_rays(
@@ -488,8 +491,9 @@ class Runner:
                     #     grads_dot_product, ZERO.expand_as(grads_dot_product))
                     loss += radiance_grad_loss * self.radiance_grad_weight
 
-                if self.focal_fix_weight > 0:
-                    focal_fix_loss = (self.trainable_camera_params.log_focal_dist_delta ** 2).mean()
+                if self.optimize_cameras and self.focal_fix_weight > 0:
+                    focal_fix_loss = \
+                        (self.trainable_camera_params.log_focal_dist_delta[scene_idx] ** 2).mean()
                     loss += focal_fix_loss * self.focal_fix_weight
 
             # These values are only needed for logging
@@ -526,9 +530,9 @@ class Runner:
                     self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
                     if self.optimize_cameras:
                         self.writer.add_scalar('Statistics/Focal distance correction 0',
-                            self.trainable_camera_params.log_focal_dist_delta.exp(), self.iter_step)
+                            self.trainable_camera_params.log_focal_dist_delta[0].exp(), self.iter_step)
                         self.writer.add_scalar('Statistics/Camera se(3) correction (abs max)',
-                            self.trainable_camera_params.pose_se3_delta.abs().max(), self.iter_step)
+                            self.trainable_camera_params.pose_se3_delta[0].abs().max(), self.iter_step)
 
                     if self.iter_step % self.report_freq == 0:
                         print(self.base_exp_dir)
@@ -548,7 +552,7 @@ class Runner:
                             for camera_extrinsics in self.dataset.pose_all[0].to(self.device):
                                 current_intrinsics, current_extrinsics = \
                                     self.trainable_camera_params.apply_params_correction(
-                                        0, camera_intrinsics, camera_extrinsics)
+                                        0, 0, camera_intrinsics, camera_extrinsics)
                                 camera_extrinsics_all.append(current_extrinsics)
 
                             camera_extrinsics_all = torch.stack(camera_extrinsics_all)
@@ -565,7 +569,7 @@ class Runner:
                             torch.save({
                                 'intrinsics': current_intrinsics,
                                 'extrinsics': camera_extrinsics_all,
-                            }, os.path.join(cameras_save_dir, f"{self.iter_step:07}.pth")
+                            }, os.path.join(cameras_save_dir, f"{self.iter_step:07}.pth"))
 
                     if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                         self.validate_mesh(

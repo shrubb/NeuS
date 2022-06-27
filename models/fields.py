@@ -821,13 +821,22 @@ class TrainableCameraParams(nn.Module):
     1 trainable parameter for intrinsics (focal distance multiplicative delta)
     and 6 for extrinsics (se(3) correction = 3 translation amounts + 3 rotation angles).
     """
-    def __init__(self, num_cameras):
-        super().__init__()
-        self.log_focal_dist_delta = nn.Parameter(torch.zeros([]))
-        self.pose_se3_delta = nn.Parameter(torch.zeros(num_cameras, 6))
-
-    def apply_params_correction(self, camera_idx, intrinsics_init, pose_init):
+    def __init__(self, num_cameras_per_scene):
         """
+        num_cameras_per_scene:
+            list of int
+            length = number of scenes in the dataset
+        """
+        super().__init__()
+        self.log_focal_dist_delta = nn.ParameterList(
+            [nn.Parameter(torch.zeros([])) for _ in range(len(num_cameras_per_scene))])
+        self.pose_se3_delta = nn.ParameterList([
+            nn.Parameter(torch.zeros(num_cameras, 6)) for num_cameras in num_cameras_per_scene])
+
+    def apply_params_correction(self, scene_idx, camera_idx, intrinsics_init, pose_init):
+        """
+        scene_idx
+            int
         camera_idx
             int
         intrinsics_init
@@ -842,11 +851,11 @@ class TrainableCameraParams(nn.Module):
             The above set of camera parameters but with trainable corrections applied.
         """
         intrinsics_new = intrinsics_init.clone()
-        focal_dist_delta = self.log_focal_dist_delta.exp()
+        focal_dist_delta = self.log_focal_dist_delta[scene_idx].exp()
         intrinsics_new[0, 0] *= focal_dist_delta
         intrinsics_new[1, 1] *= focal_dist_delta
 
-        pose_SE3_delta = utils.camera.se3_to_SE3(self.pose_se3_delta[camera_idx])
+        pose_SE3_delta = utils.camera.se3_to_SE3(self.pose_se3_delta[scene_idx][camera_idx])
         pose_new = utils.camera.compose([pose_SE3_delta, pose_init[:3, :4]])
 
         return intrinsics_new, pose_new
@@ -855,8 +864,10 @@ class TrainableCameraParams(nn.Module):
         """which_layers: no effect
         """
         if which_layers in ('all', 'scenewise'):
-            assert scene_idx is None or scene_idx == 0
-            return list(super().parameters())
+            if scene_idx is None:
+                return list(super().parameters())
+            else:
+                return [self.pose_se3_delta[scene_idx], self.log_focal_dist_delta[scene_idx]]
         elif which_layers == 'shared':
             return []
         else:

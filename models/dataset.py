@@ -92,9 +92,6 @@ class Dataset(torch.utils.data.Dataset):
         self.num_scenes = len(self.data_dirs)
         self.batch_size = conf.get_int('batch_size')
         self.return_cameras_only = return_cameras_only
-        if self.return_cameras_only and self.num_scenes > 1:
-            raise NotImplementedError(
-                f"Optimizing cameras for multiple scenes ({self.num_scenes}) is NYI")
 
         # Format for `images_to_pick[_val]` in config:
         # [[0, ["00747", "00889"]], [2, ["00053"]], ...]
@@ -344,7 +341,7 @@ class Dataset(torch.utils.data.Dataset):
             camera_extrinsics = self.pose_all[scene_idx][image_idx] # 4, 4
             camera_intrinsics = self.intrinsics_all[scene_idx][image_idx]
 
-            return camera_intrinsics, camera_extrinsics, pixels, rgb, mask
+            return image_idx, camera_intrinsics, camera_extrinsics, pixels, rgb, mask
 
         remaining_rays_to_sample = batch_size
 
