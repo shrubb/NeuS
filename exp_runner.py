@@ -163,15 +163,19 @@ class Runner:
             del self.conf['train']['restart_from_iter']
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
+
         PARTS_TO_TRAIN_ALL = set(['nerf_outside', 'sdf', 'deviation', 'color', 'cameras'])
+        PARTS_TO_TRAIN_DEFAULT = PARTS_TO_TRAIN_ALL - set(['cameras'])
+
+        parts_to_train = PARTS_TO_TRAIN_DEFAULT
+        if 'train.parts_to_train' in self.conf:
+            logging.warning(f"'train.parts_to_train' is deprecated, please migrate to 'train.parts_to_freeze'")
+            parts_to_train = set(self.conf.get_list('train.parts_to_train'))
+            for x in parts_to_train:
+                assert x in PARTS_TO_TRAIN_ALL, f"Invalid entry in 'train.parts_to_train': {x}"
         if 'train.parts_to_freeze' in self.conf:
-            parts_to_freeze = self.conf.get_list('train.parts_to_freeze', default=['cameras'])
-            for x in parts_to_freeze:
-                assert x in PARTS_TO_TRAIN_ALL, f"Invalid 'train.parts_to_freeze': {x}"
-            parts_to_train = PARTS_TO_TRAIN_ALL - set(parts_to_freeze)
-        else: # backward compatibility
-            parts_to_train = self.conf.get_list('train.parts_to_train',
-                default=PARTS_TO_TRAIN_ALL - set(['cameras']))
+            parts_to_freeze = set(self.conf.get_list('train.parts_to_freeze', default=['cameras']))
+            parts_to_train = PARTS_TO_TRAIN_DEFAULT - parts_to_freeze
         logging.info(f"Will optimize only these parts: {parts_to_train}")
 
         load_optimizer = \
@@ -195,7 +199,7 @@ class Runner:
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight', default=0.0)
         self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0.0)
-        self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight')
+        self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight', default=0.0)
 
         self.mode = args.mode
         self.model_list = []
