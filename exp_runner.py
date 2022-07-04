@@ -175,7 +175,8 @@ class Runner:
                 assert x in PARTS_TO_TRAIN_ALL, f"Invalid entry in 'train.parts_to_train': {x}"
         if 'train.parts_to_freeze' in self.conf:
             parts_to_freeze = set(self.conf.get_list('train.parts_to_freeze', default=['cameras']))
-            parts_to_train = PARTS_TO_TRAIN_DEFAULT - parts_to_freeze
+            logging.info(f"Freezing these parts: {parts_to_freeze}")
+            parts_to_train = PARTS_TO_TRAIN_ALL - parts_to_freeze
         logging.info(f"Will optimize only these parts: {parts_to_train}")
 
         load_optimizer = \
@@ -199,7 +200,7 @@ class Runner:
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight', default=0.0)
         self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0.0)
-        self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight', default=0.0)
+        self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight', default=0.1)
 
         self.mode = args.mode
         self.model_list = []
@@ -267,7 +268,7 @@ class Runner:
 
             # Get optimizer groups for parameters that are SHARED between scenes
             total_tensors, total_parameters = 0, 0
-            for part_name in parts_to_train:
+            for part_name in sorted(parts_to_train):
                 module_to_train = get_module_to_train(part_name)
                 tensors_to_train = list(module_to_train.parameters('shared'))
 
@@ -287,7 +288,7 @@ class Runner:
 
             # Get optimizer groups for parameters that correspond to only ONE scene
             total_tensors, total_parameters = 0, 0
-            for part_name in parts_to_train:
+            for part_name in sorted(parts_to_train):
                 module_to_train = get_module_to_train(part_name)
 
                 num_scenes_in_model = len(self.nerf_outside)
@@ -606,10 +607,20 @@ class Runner:
         for g in self.optimizer.param_groups:
             g['lr'] = learning_rate_factor * g['base_learning_rate']
 
-            if np.isnan(lr_shared) and 'SHARED' in g['group_name']:
-                lr_shared = g['lr']
-            if np.isnan(lr_scenewise) and 'SCENEWISE' in g['group_name']:
-                lr_scenewise = g['lr']
+            # TEMPORARY experiment
+            if g['group_name'].startswith('cameras-'):
+                def cameras_lr_factor(progress):
+                    LEFT = 0.7
+                    RIGHT = 0.71
+                    return 1.0 # max(0, min(1.0, (progress - LEFT) / (RIGHT - LEFT)))
+
+                g['lr'] *= cameras_lr_factor(progress)
+            else:
+                # For logging only
+                if np.isnan(lr_shared) and 'SHARED' in g['group_name']:
+                    lr_shared = g['lr']
+                if np.isnan(lr_scenewise) and 'SCENEWISE' in g['group_name']:
+                    lr_scenewise = g['lr']
 
         return lr_shared, lr_scenewise
 
@@ -953,7 +964,7 @@ if __name__ == '__main__':
 
         with torch.no_grad():
             runner.validate_mesh(
-                scene_idx=scene_idx, world_space=True, resolution=512, threshold=args.mcube_threshold)
+                scene_idx=scene_idx, world_space=False, resolution=512, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate_'):
         # Interpolate views given [optional: scene index and] two image indices
         arguments = args.mode.split('_')[1:]

@@ -113,7 +113,8 @@ class Dataset(torch.utils.data.Dataset):
         render_cameras_name = conf.get_string('render_cameras_name', default="cameras_sphere.npz")
 
         def load_one_scene(
-            root_dir: pathlib.Path, images_to_pick: List[str] = 'default', kind: str = 'train'):
+            root_dir: pathlib.Path, images_to_pick: List[str] = 'default', kind: str = 'train', \
+            leave_k_images: int = None):
             """
             images_to_pick
                 list of str
@@ -124,6 +125,11 @@ class Dataset(torch.utils.data.Dataset):
                 Defines behavior when `images_to_pick` is empty.
                 If 'train', will load all images in the folder.
                 If 'val', will load the first and the last one (in the sorted list of filenames).
+            leave_k_images
+                int or None
+                Choose `leave_k_images` images using reproducible random shuffle, load only them.
+                Only effective if `images_to_pick == 'default'`.
+                If None or -1, leave all images.
             """
             if images_to_pick == []:
                 return tuple([] for _ in range(8))
@@ -135,6 +141,12 @@ class Dataset(torch.utils.data.Dataset):
 
             if images_to_pick == 'default':
                 images_to_pick = [x.with_suffix('').name for x in images_list]
+
+                if leave_k_images not in (None, -1):
+                    deterministic = random.Random(123)
+                    deterministic.shuffle(images_to_pick)
+                    images_to_pick = images_to_pick[:leave_k_images]
+
                 if kind == 'val':
                     if len(images_list) >= 2:
                         images_to_pick = [images_to_pick[0], images_to_pick[-1]]
@@ -202,7 +214,8 @@ class Dataset(torch.utils.data.Dataset):
 
             return images, masks, pose_all, intrinsics_all, scale_mats_np, reg_mats_np, focal, obj_bboxes
 
-        all_data = [load_one_scene(data_dir, images_to_pick, kind=kind) \
+        leave_k_images = conf.get_int('leave_k_images', default=None)
+        all_data = [load_one_scene(data_dir, images_to_pick, kind, leave_k_images) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, \

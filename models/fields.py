@@ -261,7 +261,7 @@ class SDFNetwork(nn.Module):
 
             if layer_is_scene_specific:
                 logging.info(f"SDF: layer {l} is scene-specific")
-                if scenewise_core_rank is None:
+                if scenewise_core_rank in (None, 0):
                     lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 else:
                     lin = LowRankMultiLinear(
@@ -288,8 +288,6 @@ class SDFNetwork(nn.Module):
             f"{self.num_layers}) scene-specific layers")
 
         self.activation = nn.Softplus(beta=100)
-
-        self.is_lowrank = scenewise_core_rank is not None
         self.dims = dims
 
         # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
@@ -490,7 +488,7 @@ class RenderingNetwork(nn.Module):
 
             if layer_is_scene_specific:
                 logging.info(f"Radiance: layer {l} is scene-specific")
-                if scenewise_core_rank is None:
+                if scenewise_core_rank in (None, 0):
                     lin = nn.ModuleList(
                         [maybe_weight_norm(nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
                 else:
@@ -507,8 +505,6 @@ class RenderingNetwork(nn.Module):
             f"{self.num_layers}) scene-specific layers")
 
         self.relu = nn.ReLU()
-
-        self.is_lowrank = scenewise_core_rank is not None
         self.dims = dims
 
         # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
