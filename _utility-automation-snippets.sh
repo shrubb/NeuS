@@ -6,7 +6,7 @@ python3 eval_mesh.py \
 
 
 # compute chamfer distance
-for model_name in 100_rank50_splitReplFirstHalf 100_rank50_splitSdfOnly 100_rank50_splitReplLastHalf; do
+for model_name in 100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4_camFt; do
 for view in frontal left right; do
 for scene_id in 1b2a8613401e42a8 3b5a2eb92a501d54 444ea0dc5e85ee0b 5ae021f2805c0854 5cd49557ea450c89 609cc60fd416e187 7dd427509fe84baa 868765907f66fd85 e98bae39fad2244e f7e930d8a9ff2091; do
 
@@ -28,17 +28,17 @@ done
 done
 
 # print chamfer distance
-for model_name in 100_rank50_splitReplFirstHalf 100_rank50_splitSdfOnly 100_rank50_splitReplLastHalf; do
+for model_name in 100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4_camFt; do
 for ft_mode in scenewise full; do
 for view in frontal left right; do
 for scene_id in 1b2a8613401e42a8 3b5a2eb92a501d54 444ea0dc5e85ee0b 5ae021f2805c0854 5cd49557ea450c89 609cc60fd416e187 7dd427509fe84baa 868765907f66fd85 e98bae39fad2244e f7e930d8a9ff2091; do
 
 exp_dir=`echo logs-paper/h3ds/${model_name}/${view}/${scene_id}*`
 if [ ${ft_mode} = "scenewise" ]; then
-# printf "$(cat ${exp_dir}/eval_mesh_scenewiseOnly_${scene_id}.txt | grep sphere | cut -c 39-53) "
+#printf "$(cat ${exp_dir}/eval_mesh_scenewiseOnly_${scene_id}.txt | grep sphere | cut -c 39-53) "
 printf "$(cat ${exp_dir}/eval_mesh_scenewiseOnly_${scene_id}.txt | grep full | cut -c 37-51) "
 else
-# printf "$(cat ${exp_dir}/eval_mesh_${scene_id}.txt | grep sphere | cut -c 39-53) "
+#printf "$(cat ${exp_dir}/eval_mesh_${scene_id}.txt | grep sphere | cut -c 39-53) "
 printf "$(cat ${exp_dir}/eval_mesh_${scene_id}.txt | grep full | cut -c 37-51) "
 fi
 
@@ -132,3 +132,7 @@ let "PORT+=1"
 done
 done
 done
+
+
+
+# Extract meshes for several training scenes
