@@ -2,7 +2,7 @@
 
 # Finetune a 'metamodel'.
 
-#SBATCH --job-name 100_rank50_splitReplFirstHalf__ftTo130-3_camRegNoBug
+#SBATCH --job-name 100_rank50_splitReplFirstHalf_ftTo130-3
 #SBATCH --output ./stdout/%A.txt
 #SBATCH --time 2:40:0
 
@@ -14,21 +14,23 @@
 set -e
 
 # Set these!
-EXPERIMENT_DIR="./logs-new/100_rank50_splitReplFirstHalf__ftTo130-3_camRegNoBug"
-METAMODEL_CHECKPOINT="./logs-new/100_rank50_splitReplFirstHalf_/checkpoints/ckpt_0550000.pth"
+EXPERIMENT_DIR="./logs-new/100_rank400_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr2.5e4_ftTo130-3"
+METAMODEL_CHECKPOINT="/gpfs/data/gpfs0/egor.burkov/Projects/NeuS/logs-new/100_rank400_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr2.5e4/checkpoints/ckpt_0720000.pth"
 DATASET_DIR="./datasets/Gonzalo/130/2021-07-22-11-55-13/portrait_reconstruction/"
+# Set these if you want to use only certain images from the dataset for val/train. Otherwise, comment out.
+IMAGES_TRAIN="[\"00552\", \"00460\", \"01072\"]"
+IMAGES_VAL="[\"00929\", \"01029\"]"
 
 CONF1=`mktemp`
 cp confs/gonzalo_finetune.conf $CONF1
 CONF2=`mktemp`
 cp confs/gonzalo_finetune_allLayers.conf $CONF2
 
-PORT=26100
+PORT=26100 # Important: increment on every run
 NPROC=1
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path ${METAMODEL_CHECKPOINT} \
---conf $CONF1 --extra_config_args "general { base_exp_dir = ${EXPERIMENT_DIR} }, dataset { data_dirs = [\"${DATASET_DIR}\"], images_to_pick = [[0, [\"00552\", \"00460\", \"01072\"]]], images_to_pick_val = [[0, [\"00929\", \"01029\"]]] }, train { parts_to_freeze = [\"nerf_outside\"] }"
-# --conf $CONF1 --extra_config_args "general { base_exp_dir = ${EXPERIMENT_DIR} }, dataset { data_dirs = [\"${DATASET_DIR}\"], images_to_pick = [[0, [\"00460\"]]], images_to_pick_val = [[0, [\"00929\", \"01029\"]]] }, train { parts_to_freeze = [\"nerf_outside\"] }"
+--conf $CONF1 --extra_config_args "general { base_exp_dir = ${EXPERIMENT_DIR} }, dataset { data_dirs = [\"${DATASET_DIR}\"], images_to_pick = [[0, ${IMAGES_TRAIN:-\"default\"}]], images_to_pick_val = [[0, ${IMAGES_VAL:-\"default\"}]] }"
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --conf $CONF2 --extra_config_args "general { base_exp_dir = ${EXPERIMENT_DIR} }"
