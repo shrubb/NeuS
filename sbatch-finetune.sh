@@ -2,11 +2,11 @@
 
 # Finetune a 'metamodel'.
 
-#SBATCH --job-name 100_rank50_splitReplFirstHalf_ftTo130-3
+#SBATCH --job-name botticelli
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 2:40:0
+#SBATCH --time 2:30:0
 
-#SBATCH -p gpu #gpu,htc,gpu_a100,gpu_devel
+#SBATCH -p gpu,htc #gpu,htc,gpu_a100,gpu_devel
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
@@ -14,12 +14,12 @@
 set -e
 
 # Set these!
-EXPERIMENT_DIR="./logs-new/100_rank400_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr2.5e4_ftTo130-3"
-METAMODEL_CHECKPOINT="/gpfs/data/gpfs0/egor.burkov/Projects/NeuS/logs-new/100_rank400_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr2.5e4/checkpoints/ckpt_0720000.pth"
-DATASET_DIR="./datasets/Gonzalo/130/2021-07-22-11-55-13/portrait_reconstruction/"
+EXPERIMENT_DIR="./logs-paper/in_the_wild/100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4/botticelli"
+METAMODEL_CHECKPOINT="/gpfs/data/gpfs0/egor.burkov/Projects/NeuS/logs-new/100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4/checkpoints/ckpt_0720000.pth"
+DATASET_DIR="./datasets/in_the_wild_data/botticelli"
 # Set these if you want to use only certain images from the dataset for val/train. Otherwise, comment out.
-IMAGES_TRAIN="[\"00552\", \"00460\", \"01072\"]"
-IMAGES_VAL="[\"00929\", \"01029\"]"
+#IMAGES_TRAIN="[\"00552\", \"00460\", \"01072\"]"
+#IMAGES_VAL="[\"00929\", \"01029\"]"
 
 CONF1=`mktemp`
 cp confs/gonzalo_finetune.conf $CONF1
@@ -34,3 +34,4 @@ torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --conf $CONF2 --extra_config_args "general { base_exp_dir = ${EXPERIMENT_DIR} }"
+
