@@ -120,7 +120,6 @@ class Runner:
 
         os.makedirs(self.base_exp_dir, exist_ok=True)
 
-        # TODO remove
         self.optimize_cameras = not 'cameras' in self.conf.get_list(
             'train.parts_to_freeze', default=['cameras'])
         logging.info(f"optimize_cameras is {self.optimize_cameras}")
@@ -129,6 +128,14 @@ class Runner:
             return_cameras_only=self.optimize_cameras)
         self.dataset_val = Dataset(self.conf['dataset'], kind='val',
             return_cameras_only=self.optimize_cameras)
+
+        self.apply_camera_correction_to_val = self.conf.get_bool(
+            'train.apply_camera_correction_to_val', default=False)
+        if self.apply_camera_correction_to_val:
+            assert self.conf.get_list('dataset.images_to_pick') == \
+                self.conf.get_list('dataset.images_to_pick_val'), \
+                "You asked to apply camera params corrections to val dataset. For that, " \
+                "train and val datasets must be identical! Or know what you're doing"
 
         logging.info(f"Experiment dir: {self.base_exp_dir}")
 
@@ -728,7 +735,9 @@ class Runner:
             num_images_per_scene = len(self.dataset_val.images[val_scene_idx])
             for val_image_idx in range(num_images_per_scene):
                 rays_o, rays_d, true_rgb, mask, near, far = self.dataset_val.gen_rays_at(
-                    val_scene_idx, val_image_idx, resolution_level=resolution_level)
+                    val_scene_idx, val_image_idx, resolution_level=resolution_level,
+                    camera_params_correction=self.trainable_camera_params \
+                    if self.apply_camera_correction_to_val else None)
 
                 H, W, _ = rays_o.shape
                 rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)

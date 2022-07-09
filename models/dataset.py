@@ -297,10 +297,16 @@ class Dataset(torch.utils.data.Dataset):
 
         return rays_o, rays_v
 
-    def gen_rays_at(self, scene_idx, image_idx, resolution_level=1):
+    def gen_rays_at(self, scene_idx, image_idx, resolution_level=1, camera_params_correction=None):
         """
         Compute coordinates of points on camera rays
         that correspond to all pixels (i.e. entire rectangular image) in one camera.
+
+        camera_params_correction:
+            models.fields.TrainableCameraParams
+            If not `None`, defines correction to camera pose and focal distance.
+            NOTE: scenes in it and in this instance of Dataset should match (by indices)!!! Or,
+            you should know what you're doing.
         """
         l, t, r, b = self.object_bboxes[scene_idx][image_idx]
         # Round to resolution_level grid
@@ -313,9 +319,27 @@ class Dataset(torch.utils.data.Dataset):
         ty = torch.linspace(t, b, (b - t) // resolution_level + 1)
         pixels = torch.stack(torch.meshgrid(tx, ty), dim=-1)
 
+        # Apply camera parameters correction, if it's provided
+
+
+        if camera_params_correction is not None:
+            correction_device = camera_params_correction.pose_se3_delta[0].device
+            camera_extrinsics = self.pose_all[scene_idx][image_idx].to(correction_device)
+            camera_intrinsics = self.intrinsics_all[scene_idx][image_idx].to(correction_device)
+
+            camera_intrinsics, camera_extrinsics = \
+                camera_params_correction.apply_params_correction(
+                    scene_idx, image_idx, camera_intrinsics, camera_extrinsics)
+            camera_intrinsics_inv = torch.inverse(camera_intrinsics)
+
+            camera_extrinsics = camera_extrinsics.to(pixels.device)
+            camera_intrinsics_inv = camera_intrinsics_inv.to(pixels.device)
+        else:
+            camera_extrinsics = self.pose_all[scene_idx][image_idx]
+            camera_intrinsics_inv = self.intrinsics_all_inv[scene_idx][image_idx]
+
         rays_o, rays_v = Dataset.gen_rays(
-            pixels, self.pose_all[scene_idx][image_idx, :3, :4],
-            self.intrinsics_all_inv[scene_idx][image_idx, :3, :3], self.H, self.W)
+            pixels, camera_extrinsics[:3, :4], camera_intrinsics_inv[:3, :3], self.H, self.W)
 
         rgb, mask = self.get_image_and_mask(
             scene_idx, image_idx, resolution_level, crop=[l, t, r, b])
