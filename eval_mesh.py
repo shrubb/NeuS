@@ -76,9 +76,12 @@ class MeshEvaluator:
         self.path_gt: str = path_gt
         self.num_samples: int = num_samples
         self.device: torch.device = device
-        self.mesh_gt: Meshes = self.read_mesh(path_gt, gt=True)
-        self.bbox_gt: torch.Tensor = self.mesh_gt.get_bounding_boxes()  # (1, 3, 2)
-        self.samples_gt, self.normals_gt = self.get_gt_samples()
+        self.mesh_gt: Optional[Meshes] = None
+        self._uncutted_mesh_gt = None
+        if path_gt is not None:
+            self.mesh_gt = self.read_mesh(path_gt, gt=True)
+            self.bbox_gt: torch.Tensor = self.mesh_gt.get_bounding_boxes()  # (1, 3, 2)
+            self.samples_gt, self.normals_gt = self.get_gt_samples()
 
     def get_gt_samples(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.h3ds_scene_id is not None:
@@ -127,8 +130,9 @@ class MeshEvaluator:
                 # костыль, так как не сохранено в экспериментах изначально по-нормальному
                 mesh = transform_mesh(mesh, get_reg_transform(self.h3ds_scene_id))
 
-            _, t_icp = perform_icp(self._uncutted_mesh_gt, mesh, region_gt)
-            mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
+            if self._uncutted_mesh_gt is not None:
+                _, t_icp = perform_icp(self._uncutted_mesh_gt, mesh, region_gt)
+                mesh = transform_mesh(mesh, np.linalg.inv(t_icp))
 
             if self.h3ds_scene_id is not None and self.h3ds_region_id == 'face_sphere' and cut_pred:
                 # when metric is calculated the mesh is uncutted
@@ -237,15 +241,15 @@ class MeshEvaluator:
 
         # extrinsics
         pose = torch.tensor([
-            [9.9659306e-01, 7.6131098e-02, 3.1722244e-02, -1.6078455e+01],
-            [-7.9632021e-02, 9.8833752e-01, 1.2979856e-01, -6.3538975e+01],
-            [-2.1470578e-02, -1.3188246e-01, 9.9103284e-01, -6.1367126e+02],
-            [0.0000000e+00, 0.0000000e+00, 0.0000000e+00, 1.0000000e+00]
+            # [9.9659306e-01, 7.6131098e-02, 3.1722244e-02, -1.6078455e+01],
+            # [-7.9632021e-02, 9.8833752e-01, 1.2979856e-01, -6.3538975e+01],
+            # [-2.1470578e-02, -1.3188246e-01, 9.9103284e-01, -6.1367126e+02],
+            # [0.0000000e+00, 0.0000000e+00, 0.0000000e+00, 1.0000000e+00]
 
-            # [8.7044e-01, 1.6037e-01, -4.6542e-01, 1.3151e+00],
-            # [-1.1271e-01, 9.8526e-01, 1.2871e-01, -5.2989e-01],
-            # [4.7920e-01, -5.9573e-02, 8.7568e-01, -2.6827e+00],
-            # [0.0000e+00, 0.0000e+00, 0.0000e+00, 1.0000e+00]
+            [8.7044e-01, 1.6037e-01, -4.6542e-01, 1.3151e+00],
+            [-1.1271e-01, 9.8526e-01, 1.2871e-01, -5.2989e-01],
+            [4.7920e-01, -5.9573e-02, 8.7568e-01, -2.6827e+00],
+            [0.0000e+00, 0.0000e+00, 0.0000e+00, 1.0000e+00]
 
             # [0.6131477, 0.23778298, -0.7533321, 2.9539409],
             # [-0.16528392, 0.97113144, 0.17200263, -0.3341688],
@@ -363,10 +367,11 @@ if __name__ == '__main__':
             save_image(texture.permute(2, 0, 1), os.path.join(out_dir, f'texture_{region_suf}.png'))
             geometry = evaluator.visualize_mesh(args.mesh, HardGouraudShader, read_texture=False)
             save_image(geometry.permute(2, 0, 1), os.path.join(out_dir, f'geometry_{region_suf}.png'))
-            errors = evaluator.visualize_errors(args.mesh)
-            save_image(errors.permute(2, 0, 1), os.path.join(out_dir, f'errors_{region_suf}.png'))
-            gt_geometry = evaluator.visualize_mesh(evaluator.mesh_gt, HardGouraudShader, read_texture=False)
-            save_image(gt_geometry.permute(2, 0, 1), os.path.join(out_dir, f'gt_geometry_{region_suf}.png'))
+            if evaluator.mesh_gt is not None:
+                errors = evaluator.visualize_errors(args.mesh)
+                save_image(errors.permute(2, 0, 1), os.path.join(out_dir, f'errors_{region_suf}.png'))
+                gt_geometry = evaluator.visualize_mesh(evaluator.mesh_gt, HardGouraudShader, read_texture=False)
+                save_image(gt_geometry.permute(2, 0, 1), os.path.join(out_dir, f'gt_geometry_{region_suf}.png'))
 
     end_time = perf_counter()
     print(f"Finished {args.mesh} in {end_time - start_time} seconds.")
