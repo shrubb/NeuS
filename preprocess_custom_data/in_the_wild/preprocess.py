@@ -78,13 +78,10 @@ def get_extrinsics_given_landmarks(landmarks_2d, K):
     return K@Rt
 
 image_cropper = ImageCropper()
-def process_img(dir_path, out_path, scale_mat_0):
+def process_img(dir_path, out_path, scale_mat_0, focal_distance_x_face=14.0):
     working_dir = "./Graphonomy"
     
     ANCHOR_LANDMARK_IDXS = [8, 33, 37, 43, 0, 16]
-    
-    fx, fy = 1500, 1500
-    # print(type(dir_path), dir_path)
     
     cur_img = imageio.imread(pathlib.Path(dir_path) / "rgb.jpg")
 
@@ -96,6 +93,9 @@ def process_img(dir_path, out_path, scale_mat_0):
     l, t, r, b, _ = map(int, crop_rectangle)
 
     landmarks_2d = np.asarray(landmarks) # 68, 3
+    face_height = landmarks_2d[:, 1].max() - landmarks_2d[:, 1].min()
+    focal_distance_px = face_height * focal_distance_x_face
+
     landmarks_2d = landmarks_2d[ANCHOR_LANDMARK_IDXS, :2] # 6, 2
 
     human_data = {
@@ -106,6 +106,7 @@ def process_img(dir_path, out_path, scale_mat_0):
     human_data['crop_rectangles'].append(crop_rectangle)
     human_data['landmarks'].append(landmarks)
     
+    fx, fy = focal_distance_px, focal_distance_px
     h, w, _ = cur_img.shape
     cx = w/2
     cy = h/2
@@ -150,16 +151,22 @@ def process_img(dir_path, out_path, scale_mat_0):
     imageio.imwrite(undistorted_images_path / "00000.jpg", cur_img)
     
 if __name__ == "__main__":
-    data_path = "./datasets/Gonzalo/004/2021-05-13-15-33-44/portrait_reconstruction/"
+    data_path = "../../datasets/Gonzalo/004/2021-05-13-15-33-44/portrait_reconstruction/"
     cur_data_path = pathlib.Path(data_path)
     cameras_sphere_npz_path = cur_data_path / "cameras_sphere.npz"
     camera_matrices_file = np.load(cameras_sphere_npz_path)
     scale_mat_0 = camera_matrices_file['scale_mat_0']
 
-    in_path = pathlib.Path("in-the-wild-portraits")
+    FOCAL_DISTANCE_X_FACE = 4.0
+
+    in_path = pathlib.Path("inputs")
     
     for dir_path in tqdm.tqdm(glob.glob(str(in_path / "*"))):
         dir_name = os.path.basename(dir_path)
-        out_path = pathlib.Path("in_the_wild_data") / dir_name
+        out_path = pathlib.Path("outputs") / f"{dir_name}_{FOCAL_DISTANCE_X_FACE:.2f}Xface"
+        if out_path.exists():
+            print(f"{out_path} already exists, skipping")
+            continue
         os.makedirs(str(out_path), exist_ok=True)
-        process_img(dir_path, out_path, scale_mat_0)
+        process_img(dir_path, out_path, scale_mat_0, FOCAL_DISTANCE_X_FACE)
+
