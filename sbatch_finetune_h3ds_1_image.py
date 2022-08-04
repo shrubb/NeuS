@@ -36,7 +36,7 @@ if __name__ == '__main__':
         'f7e930d8a9ff2091': { 'left': 93, 'frontal': 4, 'right': 94, },
     }
 
-    MODEL_NAME = "100_rank3_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_seed3"
+    MODEL_NAME = "100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4"
 
     port = 25100
 
@@ -46,7 +46,7 @@ if __name__ == '__main__':
 
         for image, view_name in zip(images, VIEW_NAMES):
             experiment_name = f"{MODEL_NAME}_ftTo{scene[:4]}-1-{image}"
-            exp_dir = pathlib.Path(f"./logs-paper/h3ds/{MODEL_NAME}_camFt/{view_name}/{scene}-1-{image}")
+            exp_dir = pathlib.Path(f"./logs-paper/h3ds/{MODEL_NAME}_lowCamLR_newMaskLoss/{view_name}/{scene}-1-{image}")
             if exp_dir.is_dir():
                 print(f"Already exists, skipping: {exp_dir}")
                 port += 1
@@ -62,7 +62,7 @@ f"""#!/bin/bash
 #SBATCH --output ./stdout/%A.txt
 #SBATCH --time 2:10:0
 
-#SBATCH -p gpu_a100,htc,gpu #,gpu_devel
+#SBATCH -p gpu,htc,gpu_a100 #,gpu_devel
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
@@ -80,12 +80,45 @@ LATEST_CKPT=`ls -t ./logs-new/{MODEL_NAME}/checkpoints | head -1`
 
 PORT={port}
 NPROC=1
-torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
---checkpoint_path ./logs-new/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
---conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, ["{image}"]]], images_to_pick_val = [[0, ["{images[0]}", "{images[-1]}"]]] }}, train {{ validate_resolution_level = 1, parts_to_freeze = ["nerf_outside"] }}'
+
+# Using "if" to prevent bash from seeing read's exit code (1) and triggering "set -e"
+if read -r -d '' EXTRA_ARGS; then :; fi << EndOfText
+general {{
+    base_exp_dir = {exp_dir}
+}}
+dataset {{
+    data_dirs = ["{dataset_dir}"]
+    images_to_pick = [[0, ["{image}"]]]
+    images_to_pick_val = [[0, ["{images[0]}", "{images[-1]}"]]]
+}}
+train {{
+    validate_resolution_level = 1
+    parts_to_freeze = ["nerf_outside"]
+    cameras_optimizer_extra_args {{
+        base_learning_rate = 2.5e-5
+    }}
+}}
+EndOfText
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
---conf $CONF2 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}'
+--checkpoint_path ./logs-new/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
+--conf $CONF1 --extra_config_args "$EXTRA_ARGS"
+
+
+# Using "if" to prevent bash from seeing read's exit code (1) and triggering "set -e"
+if read -r -d '' EXTRA_ARGS; then :; fi << EndOfText
+general {{
+    base_exp_dir = {exp_dir}
+}}
+train {{
+    cameras_optimizer_extra_args {{
+        base_learning_rate = 2.5e-5
+    }}
+}}
+EndOfText
+
+torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
+--conf $CONF2 --extra_config_args "$EXTRA_ARGS"
 """
 
             with open("tmp.sh", 'w') as f:
