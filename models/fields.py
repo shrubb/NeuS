@@ -87,8 +87,8 @@ class LowRankMultiLinear(nn.Module):
         assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
-        bound = np.sqrt(3) / np.sqrt(np.sqrt(in_dim * rank))
-        nn.init.uniform_(self.basis_weights['weight'], -bound, bound)
+        bound_weight = np.sqrt(3) / (33 * np.sqrt(in_dim))
+        nn.init.uniform_(self.basis_weights['weight'], -bound_weight, bound_weight)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['weight'][..., -1].fill_(0)
@@ -101,8 +101,9 @@ class LowRankMultiLinear(nn.Module):
                 self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
+        bound_coeffs = np.sqrt(3) / (16 * np.sqrt(rank))
         for x in self.combination_coeffs:
-            nn.init.uniform_(x, -bound, bound)
+            nn.init.uniform_(x, -bound_coeffs, bound_coeffs)
 
     def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
