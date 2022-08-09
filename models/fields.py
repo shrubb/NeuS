@@ -87,14 +87,15 @@ class LowRankMultiLinear(nn.Module):
         assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
-        bound = np.sqrt(3) / np.sqrt(np.sqrt(in_dim * rank))
+        bound = np.sqrt(3) / np.sqrt(in_dim * rank)
         nn.init.uniform_(self.basis_weights['weight'], -bound, bound)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
-        nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
+        bound_bias = 1 / np.sqrt(in_dim)
+        nn.init.uniform_(self.basis_weights['bias'], -bound_bias, bound_bias)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['bias'][..., -1].fill_(0)
