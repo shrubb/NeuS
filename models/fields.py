@@ -87,15 +87,13 @@ class LowRankMultiLinear(nn.Module):
         assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
-        for i in range(rank):
-            # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
-            nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i], a=np.sqrt(5))
+        bound = np.sqrt(3) / np.sqrt(np.sqrt(in_dim * rank))
+        nn.init.uniform_(self.basis_weights['weight'], -bound, bound)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
-        bound = 1 / np.sqrt(in_dim)
         nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
         if self.use_bias:
             with torch.no_grad():
@@ -103,7 +101,7 @@ class LowRankMultiLinear(nn.Module):
 
         # Initialize linear combination coefficients
         for x in self.combination_coeffs:
-            nn.init.kaiming_uniform_(x[None], nonlinearity='linear')
+            nn.init.uniform_(x, -bound, bound)
 
     def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
