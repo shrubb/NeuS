@@ -101,7 +101,7 @@ class LowRankMultiLinear(nn.Module):
                 self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
-        bound_coeffs = np.sqrt(3) / (16 * np.sqrt(rank))
+        bound_coeffs = np.sqrt(3) / (16 * np.sqrt(1000))
         for x in self.combination_coeffs:
             nn.init.uniform_(x, -bound_coeffs, bound_coeffs)
 
