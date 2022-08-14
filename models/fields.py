@@ -87,21 +87,21 @@ class LowRankMultiLinear(nn.Module):
         assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
-        bound_weight = 1 / (4.5 * np.sqrt(in_dim))
+        bound_weight = 1 / (np.sqrt(in_dim))
         nn.init.uniform_(self.basis_weights['weight'], -bound_weight, bound_weight)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
-        bound_bias = 1 / (4.5 * np.sqrt(in_dim))
+        bound_bias = 1 / (np.sqrt(in_dim))
         nn.init.uniform_(self.basis_weights['bias'], -bound_bias, bound_bias)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
-        bound_coeffs = 1 / np.sqrt(rank)
+        bound_coeffs = np.sqrt(3) / np.sqrt(rank)
         for x in self.combination_coeffs:
             nn.init.uniform_(x, -bound_coeffs, bound_coeffs)
 
@@ -288,8 +288,8 @@ class SDFNetwork(nn.Module):
                             bias_i = lin.basis_weights['bias'][..., i]
                             geometric_init_(weight_i, bias_i)
                             with torch.no_grad():
-                                weight_i /= 4.5
-                                bias_i /= 4.5
+                                weight_i /= 4.0
+                                bias_i *= 1.5
                         if scenewise_bias:
                             with torch.no_grad():
                                 lin.basis_weights['weight'][..., -1].fill_(0)
