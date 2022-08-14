@@ -87,21 +87,21 @@ class LowRankMultiLinear(nn.Module):
         assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
 
         # Initialize weight
-        bound_weight = 1 / np.sqrt(in_dim)
+        bound_weight = 1 / (3 * np.sqrt(in_dim))
         nn.init.uniform_(self.basis_weights['weight'], -bound_weight, bound_weight)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['weight'][..., -1].fill_(0)
 
         # Initialize bias
-        bound_bias = 1 / np.sqrt(in_dim)
+        bound_bias = 1 / (3 * np.sqrt(in_dim))
         nn.init.uniform_(self.basis_weights['bias'], -bound_bias, bound_bias)
         if self.use_bias:
             with torch.no_grad():
                 self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
-        bound_coeffs = 1 / (4 * np.sqrt(rank))
+        bound_coeffs = 3 / (np.sqrt(rank))
         for x in self.combination_coeffs:
             nn.init.uniform_(x, -bound_coeffs, bound_coeffs)
 
@@ -284,9 +284,12 @@ class SDFNetwork(nn.Module):
 
                     if geometric_init:
                         for i in range(scenewise_core_rank):
-                            geometric_init_(
-                                lin.basis_weights['weight'][..., i],
-                                lin.basis_weights['bias'][..., i])
+                            weight_i = lin.basis_weights['weight'][..., i]
+                            bias_i = lin.basis_weights['bias'][..., i]
+                            geometric_init_(weight_i, bias_i)
+                            with torch.no_grad():
+                                weight_i /= 3
+                                bias_i /= 3
                         if scenewise_bias:
                             with torch.no_grad():
                                 lin.basis_weights['weight'][..., -1].fill_(0)
