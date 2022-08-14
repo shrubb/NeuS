@@ -288,8 +288,8 @@ class SDFNetwork(nn.Module):
                             bias_i = lin.basis_weights['bias'][..., i]
                             geometric_init_(weight_i, bias_i)
                             with torch.no_grad():
-                                weight_i /= 4.5
-                                bias_i /= 4.5
+                                weight_i /= 20
+                                bias_i /= 20
                         if scenewise_bias:
                             with torch.no_grad():
                                 lin.basis_weights['weight'][..., -1].fill_(0)
