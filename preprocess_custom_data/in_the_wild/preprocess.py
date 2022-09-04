@@ -83,7 +83,7 @@ def process_img(dir_path, out_path, scale_mat_0, focal_distance_x_face=14.0):
     
     ANCHOR_LANDMARK_IDXS = [8, 33, 37, 43, 0, 16]
     
-    cur_img = imageio.imread(pathlib.Path(dir_path) / "rgb.jpg")
+    cur_img = imageio.imread(pathlib.Path(dir_path) / "rgb.jpg", pilmode='RGB')
 
     try:
         crop_rectangle, _, landmarks = image_cropper.crop_to_face(cur_img)
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     camera_matrices_file = np.load(cameras_sphere_npz_path)
     scale_mat_0 = camera_matrices_file['scale_mat_0']
 
-    FOCAL_DISTANCE_X_FACE = 4.0
+    FOCAL_DISTANCE_X_FACE = 14.0
 
     in_path = pathlib.Path("inputs")
     
