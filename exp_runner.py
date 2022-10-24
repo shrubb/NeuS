@@ -26,6 +26,15 @@ import argparse
 from shutil import copyfile
 import contextlib
 
+GRAY = 190 / 255
+CLIP_INPUT_TRANSFORM = torchvision.transforms.Compose([
+    torchvision.transforms.Resize(224),
+    torchvision.transforms.CenterCrop(224),
+    torchvision.transforms.Normalize(
+        (0.48145466, 0.4578275, 0.40821073),
+        (0.26862954, 0.26130258, 0.27577711)),
+])
+
 def psnr(color_fine, true_rgb, mask):
     assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
     return 20.0 * torch.log10(
@@ -399,27 +408,25 @@ class Runner:
 
             for ref_image_idx in range(len(self.dataset.images[ref_scene_idx])):
                 # Load image from dataset, cropped to head
-                crop = self.object_bboxes[ref_scene_idx][ref_image_idx]
+                crop = self.dataset.object_bboxes[ref_scene_idx][ref_image_idx]
                 ref_image, ref_mask = self.dataset.get_image_and_mask(
                     ref_scene_idx, ref_image_idx, crop=crop)
 
                 # Apply gray background using dataset's mask
-                GRAY = 190 / 255
-                ref_image = mask * ref_image + (1.0 - mask) * GRAY
+                ref_image = ref_mask * ref_image + (1.0 - ref_mask) * GRAY
 
                 # Compute and save CLIP embedding
                 ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
-                ref_image = torchvision.transforms.Normalize(
-                    (0.48145466, 0.4578275, 0.40821073),
-                    (0.26862954, 0.26130258, 0.27577711))(ref_image)
+                ref_image = CLIP_INPUT_TRANSFORM(ref_image)
                 ref_image = ref_image[None].to(self.device)
                 with torch.no_grad():
-                    embedding = self.clip_model.encode_image(ref_image)[0]
+                    embedding = self.clip_model.encode_image(ref_image)[0].float()
                 embedding /= embedding.norm()
                 ref_embeddings.append(embedding)
 
             ref_embedding = torch.stack(ref_embeddings).mean(0)
             ref_embedding /= ref_embedding.norm()
+            self.reference_semantic_embedding = ref_embedding
 
     # This is to average gradients of shared parameters after each iteration
     def average_shared_gradients_between_GPUs(self):
@@ -451,110 +458,138 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
 
-            # if self.iter_step % self.semantic_consistency_every_k_iterations == 0:
-            #     @@@@
+            # Special semantic consistency update iteration
+            if self.semantic_consistency_weight > 0 and \
+               self.iter_step % self.semantic_consistency_every_k_iterations == 0:
 
-            if self.optimize_cameras:
-                scene_idx, (image_idx, camera_intrinsics, camera_extrinsics, \
-                    pixels, true_rgb, mask) = next(data_loader)
+                SCENE_IDX = 0
+                H, W = 200, 200
+                POSE = torch.tensor([
+                    [-2.31622174e-01, -5.49429409e-08,  9.72805917e-01, -5.59038472e+00],
+                    [ 1.55864701e-01,  9.87081170e-01,  3.71109620e-02, -9.68393748e-01],
+                    [-9.60238278e-01,  1.60221800e-01, -2.28629708e-01, 9.78317243e+00]])
+                INTRINSICS = torch.tensor([
+                    [766.66666667,   0.        ,  99.5       ],
+                    [  0.        , 766.66666667,  99.5       ],
+                    [  0.        ,   0.        ,   1.        ]])
 
-                pixels = pixels.to(self.device)
-                camera_extrinsics = camera_extrinsics.to(self.device) # 4, 4
-                camera_intrinsics = camera_intrinsics.to(self.device) # 4, 4
+                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                    rendered_rgb = self.render_view_by_pose(0, H, W, POSE, INTRINSICS)
+                rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
+                rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
+                rendered_rgb = rendered_rgb[None].to(self.device)
 
-                camera_intrinsics, camera_extrinsics = \
-                    self.trainable_camera_params.apply_params_correction(
-                        scene_idx, image_idx, camera_intrinsics, camera_extrinsics)
-                camera_intrinsics_inv = torch.inverse(camera_intrinsics)
+                embedding_of_render = self.clip_model.encode_image(rendered_rgb)[0].float()
+                embedding_of_render /= embedding_of_render.norm()
 
-                rays_o, rays_d = self.dataset.gen_rays(
-                    pixels, camera_extrinsics[:3, :4], camera_intrinsics_inv[:3, :3],
-                    self.dataset.H, self.dataset.W)
-                near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+                semantic_consistency_loss = \
+                    ((self.reference_semantic_embedding - embedding_of_render) ** 2).mean()
+
+                loss = semantic_consistency_loss
+
+            # Otherwise, normal NeuS update iteration
             else:
-                scene_idx, (rays_o, rays_d, true_rgb, mask, near, far) = next(data_loader)
+                if self.optimize_cameras:
+                    scene_idx, (image_idx, camera_intrinsics, camera_extrinsics, \
+                        pixels, true_rgb, mask) = next(data_loader)
 
-            rays_o = rays_o.to(self.device)
-            rays_d = rays_d.to(self.device)
-            true_rgb = true_rgb.to(self.device)
-            mask = mask.to(self.device)
-            near = near.to(self.device)
-            far = far.to(self.device)
-            # ZERO = torch.zeros(1, 1).to(self.device)
+                    pixels = pixels.to(self.device)
+                    camera_extrinsics = camera_extrinsics.to(self.device) # 4, 4
+                    camera_intrinsics = camera_intrinsics.to(self.device) # 4, 4
 
-            mask_sum = mask.sum() + 1e-5
+                    camera_intrinsics, camera_extrinsics = \
+                        self.trainable_camera_params.apply_params_correction(
+                            scene_idx, image_idx, camera_intrinsics, camera_extrinsics)
+                    camera_intrinsics_inv = torch.inverse(camera_intrinsics)
 
-            background_rgb = None
-            if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3])
-
-            with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                render_out = self.renderer.render(
-                    rays_o, rays_d, near, far, scene_idx,
-                    background_rgb=background_rgb,
-                    cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                    compute_eikonal_loss=self.igr_weight > 0,
-                    compute_radiance_grad_loss=self.radiance_grad_weight > 0)
-
-                color_fine = render_out['color_fine']
-                s_val = render_out['s_val']
-                cdf_fine = render_out['cdf_fine']
-                gradients = render_out['gradients']
-                weight_max = render_out['weight_max']
-                weight_sum = render_out['weight_sum']
-
-                loss = 0
-
-                # Image loss: L1
-                target_rgb = true_rgb
-                if self.mask_weight > 0.0:
-                    color_fine_loss = ((color_fine - target_rgb) * mask).abs().mean()
+                    rays_o, rays_d = self.dataset.gen_rays(
+                        pixels, camera_extrinsics[:3, :4], camera_intrinsics_inv[:3, :3],
+                        self.dataset.H, self.dataset.W)
+                    near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
                 else:
+                    scene_idx, (rays_o, rays_d, true_rgb, mask, near, far) = next(data_loader)
+
+                rays_o = rays_o.to(self.device)
+                rays_d = rays_d.to(self.device)
+                true_rgb = true_rgb.to(self.device)
+                mask = mask.to(self.device)
+                near = near.to(self.device)
+                far = far.to(self.device)
+                # ZERO = torch.zeros(1, 1).to(self.device)
+
+                mask_sum = mask.sum() + 1e-5
+
+                background_rgb = None
+                if self.use_white_bkgd:
+                    background_rgb = torch.ones([1, 3])
+
+                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                    render_out = self.renderer.render(
+                        rays_o, rays_d, near, far, scene_idx,
+                        background_rgb=background_rgb,
+                        cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                        compute_eikonal_loss=self.igr_weight > 0,
+                        compute_radiance_grad_loss=self.radiance_grad_weight > 0)
+
+                    color_fine = render_out['color_fine']
+                    s_val = render_out['s_val']
+                    cdf_fine = render_out['cdf_fine']
+                    gradients = render_out['gradients']
+                    weight_max = render_out['weight_max']
+                    weight_sum = render_out['weight_sum']
+
+                    loss = 0
+
+                    # Image loss: L1
                     target_rgb = true_rgb
-                    color_fine_loss = (color_fine - target_rgb).abs().mean()
-                loss += color_fine_loss
+                    if self.mask_weight > 0.0:
+                        color_fine_loss = ((color_fine - target_rgb) * mask).abs().mean()
+                    else:
+                        target_rgb = true_rgb
+                        color_fine_loss = (color_fine - target_rgb).abs().mean()
+                    loss += color_fine_loss
 
-                psnr_train = psnr(color_fine, true_rgb, mask)
+                    psnr_train = psnr(color_fine, true_rgb, mask)
 
-                # Mask loss: BCE
-                if self.mask_weight > 0.0:
-                    mask_loss = torch.nn.functional.binary_cross_entropy(
-                        weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
-                    loss += mask_loss * self.mask_weight
+                    # Mask loss: BCE
+                    if self.mask_weight > 0.0:
+                        mask_loss = torch.nn.functional.binary_cross_entropy(
+                            weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
+                        loss += mask_loss * self.mask_weight
 
-                # SDF loss: eikonal
-                if self.igr_weight > 0:
-                    # boolean mask, 1 if point is inside 1-sphere
-                    relax_inside_sphere = render_out['relax_inside_sphere']
+                    # SDF loss: eikonal
+                    if self.igr_weight > 0:
+                        # boolean mask, 1 if point is inside 1-sphere
+                        relax_inside_sphere = render_out['relax_inside_sphere']
 
-                    gradients_eikonal = render_out['gradients_eikonal']
-                    gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
-                    eikonal_loss = \
-                        (relax_inside_sphere * gradient_error).sum() / \
-                        (relax_inside_sphere.sum() + 1e-5)
-                    loss += eikonal_loss * self.igr_weight
+                        gradients_eikonal = render_out['gradients_eikonal']
+                        gradient_error = (torch.linalg.norm(gradients_eikonal, ord=2, dim=-1) - 1.0) ** 2
+                        eikonal_loss = \
+                            (relax_inside_sphere * gradient_error).sum() / \
+                            (relax_inside_sphere.sum() + 1e-5)
+                        loss += eikonal_loss * self.igr_weight
 
-                # Radiance loss: gradient orthogonality
-                if self.radiance_grad_weight > 0:
-                    # dim 0: gradient of r/g/b
-                    # dim 1: point number
-                    # dim 2: gradient over x/y/z
-                    gradients_radiance = render_out['gradients_radiance'] # 3, K, 3
-                    gradients_eikonal_ = gradients_eikonal[None] # 1, K, 3
+                    # Radiance loss: gradient orthogonality
+                    if self.radiance_grad_weight > 0:
+                        # dim 0: gradient of r/g/b
+                        # dim 1: point number
+                        # dim 2: gradient over x/y/z
+                        gradients_radiance = render_out['gradients_radiance'] # 3, K, 3
+                        gradients_eikonal_ = gradients_eikonal[None] # 1, K, 3
 
-                    # We want these gradients to be orthogonal, so force dot product to zero
-                    grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K
-                    radiance_grad_loss = (grads_dot_product ** 2).mean()
-                    # radiance_grad_loss = torch.nn.HuberLoss(delta=0.0122)(
-                    #     grads_dot_product, ZERO.expand_as(grads_dot_product))
-                    loss += radiance_grad_loss * self.radiance_grad_weight
+                        # We want these gradients to be orthogonal, so force dot product to zero
+                        grads_dot_product = (gradients_eikonal * gradients_radiance).sum(-1) # 3, K
+                        radiance_grad_loss = (grads_dot_product ** 2).mean()
+                        # radiance_grad_loss = torch.nn.HuberLoss(delta=0.0122)(
+                        #     grads_dot_product, ZERO.expand_as(grads_dot_product))
+                        loss += radiance_grad_loss * self.radiance_grad_weight
 
-                if self.optimize_cameras and self.focal_fix_weight > 0:
-                    focal_fix_loss = \
-                        (self.trainable_camera_params.log_focal_dist_delta[scene_idx] ** 2).mean()
-                    loss += focal_fix_loss * self.focal_fix_weight
+                    if self.optimize_cameras and self.focal_fix_weight > 0:
+                        focal_fix_loss = \
+                            (self.trainable_camera_params.log_focal_dist_delta[scene_idx] ** 2).mean()
+                        loss += focal_fix_loss * self.focal_fix_weight
 
-            # These values are only needed for logging
+            # The return values are only needed for logging
             learning_rate_shared, learning_rate_scenewise = self.update_learning_rate()
             self.optimizer.zero_grad()
             self.gradient_scaler.scale(loss).backward()
@@ -856,45 +891,90 @@ class Runner:
                 'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
             self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
-    def render_novel_image(self, scene_idx, idx_0, idx_1, ratio, resolution_level):
+    def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics):
+        """
+        Pose can optionally be obtained from Blender. Open any mesh obtained by running
+        this code with `--mode validate_mesh_XX` and export the pose with this plugin:
+        https://github.com/Cartucho/vision_blender/. The plugin will output two files,
+        'XXXX.npz' and 'camera_info.json'.
+
+        scene_idx
+            int
+            Refers to a scene in `self.dataset`.
+        h, w
+            int
+            `npz['normal_map'].shape[:2]`, or get it from 'camera_info.json'.
+        pose_blender
+            torch.tensor, float32, shape == (3, 4)
+            `npz['extrinsic_mat']`.
+        intrinsics
+            torch.tensor, float32, shape == (3, 3)
+            `npz['intrinsic_mat']`.
+        """
+        tx = torch.linspace(0, w - 1, w)
+        ty = torch.linspace(0, h - 1, h)
+        pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # w, h, 2
+
+        intrinsics_inv = intrinsics.inverse()
+
+        def augment_to_4x4(m):
+            if m.shape[1] == 3:
+                m = torch.cat([m, torch.tensor([[0, 0, 0]]).T], dim=1)
+            if m.shape[0] == 3:
+                m = torch.cat([m, torch.tensor([[0, 0, 0, 1]])])
+            return m
+
+        # Apply the "scale mat" transform to the given pose.
+        # This transform moves 'reference landmarks' to the origin and scales them.
+        proj_matrix = augment_to_4x4(intrinsics) @ augment_to_4x4(pose)
+        proj_matrix @= torch.tensor(self.dataset.scale_mats_np[scene_idx][0])
+
+        _, pose = load_K_Rt_from_P(None, proj_matrix[:3].numpy())
+        pose = torch.tensor(pose)[:3]
+
+        rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w)
+        near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+
+        rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
+        rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
+        near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
+        far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
+
+        rgb_all = []
+        normals_all = []
+
+        total_batches_computed = 0
+        for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
+            gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
+            gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
+            gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
+            print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
+                  f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
+
+            background_rgb = torch.empty(1, 3).fill_(GRAY).to(self.device) # TODO: optionally None for black bkgd
+
+            render_out = self.renderer.render(rays_o_batch,
+                                              rays_d_batch,
+                                              near_batch,
+                                              far_batch,
+                                              scene_idx,
+                                              cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                              background_rgb=background_rgb,
+                                              compute_eikonal_loss=False,
+                                              compute_radiance_grad_loss=False)
+
+            rgb_all.append(render_out['color_fine'])
+            del render_out
+
+        img_fine = torch.cat(rgb_all).reshape([h, w, 3]) # float32, 0..1
+        return img_fine
+
+    def render_interpolated_view(self, scene_idx, idx_0, idx_1, ratio, resolution_level):
         """
         Interpolate view between two cameras.
         """
-        if idx_0 is None:
-            h = 800
-            w = 800
-            tx = torch.linspace(0, w - 1, w)
-            ty = torch.linspace(0, h - 1, h)
-            pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # w, h, 2
-
-            pose_blender = torch.tensor([ # plugin 'extrinsic_mat', inv
-                [-2.38283664e-01, -4.53110225e-08,  9.71195698e-01, -5.52300928e+00],
-                [ 1.49798423e-01,  9.88033354e-01,  3.67532037e-02, -9.15004363e-01],
-                [-9.59573627e-01,  1.54241264e-01, -2.35432014e-01,  9.82648394e+00]])
-            intrinsics = torch.tensor([
-                [2.86666667e+03, 0.00000000e+00, 3.99500000e+02],
-                [0.00000000e+00, 2.86666667e+03, 3.99500000e+02],
-                [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
-            intrinsics_inv = intrinsics.inverse()
-
-            def augment_to_4x4(m):
-                if m.shape[1] == 3:
-                    m = torch.cat([m, torch.tensor([[0, 0, 0]]).T], dim=1)
-                if m.shape[0] == 3:
-                    m = torch.cat([m, torch.tensor([[0, 0, 0, 1]])])
-                return m
-
-            proj_matrix = augment_to_4x4(intrinsics) @ augment_to_4x4(pose_blender)
-            proj_matrix @= torch.tensor(self.dataset.scale_mats_np[scene_idx][0])
-
-            _, pose = load_K_Rt_from_P(None, proj_matrix[:3].numpy())
-            pose = torch.tensor(pose)[:3]
-
-            rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w)
-            near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
-        else:
-            rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
-                scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
+        rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
+            scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
 
         H, W, _ = rays_o.shape
         rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
@@ -979,8 +1059,8 @@ class Runner:
 
         logging.info('End')
 
-    def interpolate_view(self, scene_idx, img_idx_0, img_idx_1, n_frames=30):
-        # image, normals = self.render_novel_image(
+    def interpolate_view(self, scene_idx, img_idx_0, img_idx_1, n_frames=20):
+        # image, normals = self.render_interpolated_view(
         #     scene_idx, None, None, 0.0, resolution_level=2)
         # frame = np.concatenate([image, normals], axis=0)
         # cv2.imwrite(
@@ -994,7 +1074,7 @@ class Runner:
         assert n_frames > 1
         images = []
         for i in tqdm(range(n_frames)):
-            image, normals = self.render_novel_image(
+            image, normals = self.render_interpolated_view(
                 scene_idx, img_idx_0, img_idx_1,
                 np.sin(((i / (n_frames - 1)) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2)
             video_frame = np.concatenate([image, normals], axis=0)

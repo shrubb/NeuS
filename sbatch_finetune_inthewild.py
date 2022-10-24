@@ -62,10 +62,26 @@ PORT={port}
 NPROC=1
 
 # ======= Fit and fine-tune the model =======
+# Using "if" to prevent bash from seeing read's exit code (1) and triggering "set -e"
+if read -r -d '' EXTRA_ARGS; then :; fi << EndOfText
+general {{
+    base_exp_dir = {exp_dir}
+}}
+dataset {{
+    data_dirs = ["{dataset_dir}"]
+    images_to_pick = [[0, "default"]]
+    images_to_pick_val = [[0, "default"]]
+    batch_size = 512
+}}
+train {{
+    batch_size = \\${{dataset.batch_size}}
+    semantic_consistency_weight = 0.1
+}}
+EndOfText
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path ./logs-new/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
---conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, "default"]], images_to_pick_val = [[0, "default"]], batch_size = 512 }}, train {{ batch_size = ${{dataset.batch_size}} }}'
+--conf $CONF1 --extra_config_args "${{EXTRA_ARGS}}"
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --conf $CONF2 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}'
