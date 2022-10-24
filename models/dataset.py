@@ -253,7 +253,9 @@ class Dataset(torch.utils.data.Dataset):
 
             return torch.from_numpy(image.astype(np.float32) / 255.0)
 
+        # H, W, 3
         image = resize_and_convert(self.images[scene_idx][image_idx].numpy(), resolution_level)
+        # H, W, 1
         mask = resize_and_convert(self.masks[scene_idx][image_idx].numpy(), resolution_level)[..., None]
 
         return image, mask
@@ -317,7 +319,7 @@ class Dataset(torch.utils.data.Dataset):
 
         tx = torch.linspace(l, r, (r - l) // resolution_level + 1)
         ty = torch.linspace(t, b, (b - t) // resolution_level + 1)
-        pixels = torch.stack(torch.meshgrid(tx, ty), dim=-1)
+        pixels = torch.stack(torch.meshgrid(tx, ty, indexing='ij'), dim=-1)
 
         # Apply camera parameters correction, if it's provided
 
@@ -443,7 +445,7 @@ class Dataset(torch.utils.data.Dataset):
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
         ty = torch.linspace(0, self.H - 1, self.H // l)
-        pixels_x, pixels_y = torch.meshgrid(tx, ty)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
         p = torch.matmul(self.intrinsics_all_inv[scene_idx][0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3

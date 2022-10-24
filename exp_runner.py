@@ -1,6 +1,6 @@
 from typing import List
 
-from models.dataset import Dataset
+from models.dataset import Dataset, load_K_Rt_from_P
 from models.fields import \
     RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF, TrainableCameraParams
 from models.renderer import NeuSRenderer
@@ -9,12 +9,13 @@ import cv2
 import numpy as np
 import trimesh
 import torch
-import torch.nn.functional as F
+import torchvision.transforms
 from torch.utils.tensorboard import SummaryWriter
 import apex
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
 from pyhocon.converter import HOCONConverter
+import clip
 
 import random
 import pathlib
@@ -203,11 +204,16 @@ class Runner:
             assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
             assert self.dataset_val.num_scenes == 1, "Can only finetune to one scene"
 
-        # Weights
+        # Loss weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight', default=0.0)
         self.radiance_grad_weight = self.conf.get_float('train.radiance_grad_weight', default=0.0)
         self.focal_fix_weight = self.conf.get_float('train.focal_fix_weight', default=0.1)
+        self.semantic_consistency_weight = self.conf.get_float('train.semantic_consistency_weight',
+            default=0.0)
+
+        self.semantic_consistency_every_k_iterations = self.conf.get_int(
+            'train.semantic_consistency_every_k_iterations', default=15)
 
         self.mode = args.mode
         self.model_list = []
@@ -380,6 +386,41 @@ class Runner:
         if self.mode[:5] == 'train' and self.rank == 0:
             self.file_backup()
 
+        if self.semantic_consistency_weight > 0:
+            logging.info(f"Loading CLIP and computing semantic descriptors from dataset")
+
+            # Initialize CLIP model
+            self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
+            self.clip_model.requires_grad_(False)
+
+            # Initialize reference CLIP embedding
+            ref_scene_idx = 0
+            ref_embeddings = []
+
+            for ref_image_idx in range(len(self.dataset.images[ref_scene_idx])):
+                # Load image from dataset, cropped to head
+                crop = self.object_bboxes[ref_scene_idx][ref_image_idx]
+                ref_image, ref_mask = self.dataset.get_image_and_mask(
+                    ref_scene_idx, ref_image_idx, crop=crop)
+
+                # Apply gray background using dataset's mask
+                GRAY = 190 / 255
+                ref_image = mask * ref_image + (1.0 - mask) * GRAY
+
+                # Compute and save CLIP embedding
+                ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
+                ref_image = torchvision.transforms.Normalize(
+                    (0.48145466, 0.4578275, 0.40821073),
+                    (0.26862954, 0.26130258, 0.27577711))(ref_image)
+                ref_image = ref_image[None].to(self.device)
+                with torch.no_grad():
+                    embedding = self.clip_model.encode_image(ref_image)[0]
+                embedding /= embedding.norm()
+                ref_embeddings.append(embedding)
+
+            ref_embedding = torch.stack(ref_embeddings).mean(0)
+            ref_embedding /= ref_embedding.norm()
+
     # This is to average gradients of shared parameters after each iteration
     def average_shared_gradients_between_GPUs(self):
         if self.world_size == 1:
@@ -409,6 +450,9 @@ class Runner:
 
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
+
+            # if self.iter_step % self.semantic_consistency_every_k_iterations == 0:
+            #     @@@@
 
             if self.optimize_cameras:
                 scene_idx, (image_idx, camera_intrinsics, camera_extrinsics, \
@@ -474,7 +518,8 @@ class Runner:
 
                 # Mask loss: BCE
                 if self.mask_weight > 0.0:
-                    mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
+                    mask_loss = torch.nn.functional.binary_cross_entropy(
+                        weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
                     loss += mask_loss * self.mask_weight
 
                 # SDF loss: eikonal
@@ -815,8 +860,42 @@ class Runner:
         """
         Interpolate view between two cameras.
         """
-        rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
-            scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
+        if idx_0 is None:
+            h = 800
+            w = 800
+            tx = torch.linspace(0, w - 1, w)
+            ty = torch.linspace(0, h - 1, h)
+            pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # w, h, 2
+
+            pose_blender = torch.tensor([ # plugin 'extrinsic_mat', inv
+                [-2.38283664e-01, -4.53110225e-08,  9.71195698e-01, -5.52300928e+00],
+                [ 1.49798423e-01,  9.88033354e-01,  3.67532037e-02, -9.15004363e-01],
+                [-9.59573627e-01,  1.54241264e-01, -2.35432014e-01,  9.82648394e+00]])
+            intrinsics = torch.tensor([
+                [2.86666667e+03, 0.00000000e+00, 3.99500000e+02],
+                [0.00000000e+00, 2.86666667e+03, 3.99500000e+02],
+                [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+            intrinsics_inv = intrinsics.inverse()
+
+            def augment_to_4x4(m):
+                if m.shape[1] == 3:
+                    m = torch.cat([m, torch.tensor([[0, 0, 0]]).T], dim=1)
+                if m.shape[0] == 3:
+                    m = torch.cat([m, torch.tensor([[0, 0, 0, 1]])])
+                return m
+
+            proj_matrix = augment_to_4x4(intrinsics) @ augment_to_4x4(pose_blender)
+            proj_matrix @= torch.tensor(self.dataset.scale_mats_np[scene_idx][0])
+
+            _, pose = load_K_Rt_from_P(None, proj_matrix[:3].numpy())
+            pose = torch.tensor(pose)[:3]
+
+            rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w)
+            near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+        else:
+            rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
+                scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
+
         H, W, _ = rays_o.shape
         rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
@@ -855,7 +934,7 @@ class Runner:
         img_fine = (np.concatenate(rgb_all, axis=0).reshape([H, W, 3]) * 255).clip(0, 255).astype(np.uint8)
 
         normal_img = np.concatenate(normals_all)
-        rot = pose[:3, :3]
+        rot = np.asarray(pose[:3, :3])
         normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
         normal_img = (normal_img.clip(0.0, 1.0) * 255).astype(np.uint8)
 
@@ -901,6 +980,17 @@ class Runner:
         logging.info('End')
 
     def interpolate_view(self, scene_idx, img_idx_0, img_idx_1, n_frames=30):
+        # image, normals = self.render_novel_image(
+        #     scene_idx, None, None, 0.0, resolution_level=2)
+        # frame = np.concatenate([image, normals], axis=0)
+        # cv2.imwrite(
+        #     os.path.join(
+        #         self.base_exp_dir,
+        #         'render',
+        #         f"{self.iter_step:0>8d}_scene{scene_idx:03d}_blender9simplify.png"),
+        #     frame)
+        # return
+
         assert n_frames > 1
         images = []
         for i in tqdm(range(n_frames)):
@@ -976,7 +1066,7 @@ if __name__ == '__main__':
             runner.validate_mesh(
                 scene_idx=scene_idx, world_space=False, resolution=512, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate_'):
-        # Interpolate views given [optional: scene index and] two image indices
+        # Interpolate views, given [optional: scene index and] two image indices
         arguments = args.mode.split('_')[1:]
         if len(arguments) == 2:
             scene_idx, (img_idx_0, img_idx_1) = 0, map(int, arguments)
