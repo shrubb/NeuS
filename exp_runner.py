@@ -34,6 +34,7 @@ CLIP_INPUT_TRANSFORM = torchvision.transforms.Compose([
         (0.48145466, 0.4578275, 0.40821073),
         (0.26862954, 0.26130258, 0.27577711)),
 ])
+CLIP_H, CLIP_W = 70, 70
 
 def psnr(color_fine, true_rgb, mask):
     assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
@@ -417,6 +418,8 @@ class Runner:
 
                 # Compute and save CLIP embedding
                 ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
+                ref_image = torchvision.transforms.Resize(CLIP_H,
+                    interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
                 ref_image = CLIP_INPUT_TRANSFORM(ref_image)
                 ref_image = ref_image[None].to(self.device)
                 with torch.no_grad():
@@ -458,29 +461,29 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
 
-            # Special semantic consistency update iteration
-            if self.semantic_consistency_weight > 0 and \
-               self.iter_step % self.semantic_consistency_every_k_iterations == 0:
+            is_semantic_consistency_step = self.semantic_consistency_weight > 0 and \
+                self.iter_step % self.semantic_consistency_every_k_iterations == 0
 
-                SCENE_IDX = 0
-                H, W = 200, 200
+            # Special semantic consistency update iteration
+            if is_semantic_consistency_step:
+                scene_idx = 0
                 POSE = torch.tensor([
                     [-2.31622174e-01, -5.49429409e-08,  9.72805917e-01, -5.59038472e+00],
                     [ 1.55864701e-01,  9.87081170e-01,  3.71109620e-02, -9.68393748e-01],
                     [-9.60238278e-01,  1.60221800e-01, -2.28629708e-01, 9.78317243e+00]])
                 INTRINSICS = torch.tensor([
-                    [766.66666667,   0.        ,  99.5       ],
-                    [  0.        , 766.66666667,  99.5       ],
-                    [  0.        ,   0.        ,   1.        ]])
+                    [  3.83333333 * CLIP_H,   0.                 ,  0.49 * CLIP_H   ],
+                    [  0.                 ,   3.83333333 * CLIP_W,  0.49 * CLIP_W   ],
+                    [  0.                 ,   0.                 ,        1.        ]])
 
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                    rendered_rgb = self.render_view_by_pose(0, H, W, POSE, INTRINSICS)
+                    rendered_rgb = self.render_view_by_pose(0, CLIP_H, CLIP_W, POSE, INTRINSICS)
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
                 rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
                 rendered_rgb = rendered_rgb[None].to(self.device)
 
                 embedding_of_render = self.clip_model.encode_image(rendered_rgb)[0].float()
-                embedding_of_render /= embedding_of_render.norm()
+                embedding_of_render = embedding_of_render / embedding_of_render.norm()
 
                 semantic_consistency_loss = \
                     ((self.reference_semantic_embedding - embedding_of_render) ** 2).mean()
@@ -610,22 +613,28 @@ class Runner:
 
                 if self.rank == 0:
                     self.writer.add_scalar('Loss/Total', loss, self.iter_step)
-                    self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
-                    if self.radiance_grad_weight > 0:
-                        self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
-                        self.writer.add_scalar('Loss/<dRGB,dSDF>', radiance_grad_loss, self.iter_step)
-                    self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
-                    self.writer.add_scalar('Statistics/s_val', s_val.item(), self.iter_step)
-                    self.writer.add_scalar('Statistics/Learning rate', learning_rate_shared, self.iter_step)
-                    self.writer.add_scalar('Statistics/Learning rate (scenewise)', learning_rate_scenewise, self.iter_step)
-                    self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
-                    self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-                    self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
-                    if self.optimize_cameras:
-                        self.writer.add_scalar('Statistics/Focal distance correction 0',
-                            self.trainable_camera_params.log_focal_dist_delta[0].exp(), self.iter_step)
-                        self.writer.add_scalar('Statistics/Camera se(3) correction (abs max)',
-                            self.trainable_camera_params.pose_se3_delta[0].abs().max(), self.iter_step)
+                    if is_semantic_consistency_step:
+                        self.writer.add_scalar('Loss/Semantic', loss, self.iter_step)
+                    else:
+                        self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
+                        if self.radiance_grad_weight > 0:
+                            self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
+                            self.writer.add_scalar('Loss/<dRGB,dSDF>', radiance_grad_loss, self.iter_step)
+                        self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
+                        self.writer.add_scalar('Statistics/s_val', s_val.item(), self.iter_step)
+                        self.writer.add_scalar('Statistics/Learning rate', learning_rate_shared, self.iter_step)
+                        self.writer.add_scalar('Statistics/Learning rate (scenewise)', learning_rate_scenewise, self.iter_step)
+                        self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+                        self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+                        if self.optimize_cameras:
+                            self.writer.add_scalar('Statistics/Focal distance correction 0',
+                                self.trainable_camera_params.log_focal_dist_delta[0].exp(), self.iter_step)
+                            self.writer.add_scalar('Statistics/Camera se(3) correction (abs max)',
+                                self.trainable_camera_params.pose_se3_delta[0].abs().max(), self.iter_step)
+
+                    self.writer.add_scalar(
+                        'Statistics/Step time' + ', semantic' * is_semantic_consistency_step,
+                        step_time, self.iter_step)
 
                     if self.iter_step % self.report_freq == 0:
                         print(self.base_exp_dir)
