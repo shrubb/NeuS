@@ -26,7 +26,6 @@ import argparse
 from shutil import copyfile
 import contextlib
 
-GRAY = 190 / 255
 CLIP_INPUT_TRANSFORM = torchvision.transforms.Compose([
     torchvision.transforms.Resize(224),
     torchvision.transforms.CenterCrop(224),
@@ -397,39 +396,11 @@ class Runner:
             self.file_backup()
 
         if self.semantic_consistency_weight > 0:
-            logging.info(f"Loading CLIP and computing semantic descriptors from dataset")
+            logging.info(f"Loading CLIP")
 
             # Initialize CLIP model
             self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
             self.clip_model.requires_grad_(False)
-
-            # Initialize reference CLIP embedding
-            ref_scene_idx = 0
-            ref_embeddings = []
-
-            for ref_image_idx in range(len(self.dataset.images[ref_scene_idx])):
-                # Load image from dataset, cropped to head
-                crop = self.dataset.object_bboxes[ref_scene_idx][ref_image_idx]
-                ref_image, ref_mask = self.dataset.get_image_and_mask(
-                    ref_scene_idx, ref_image_idx, crop=crop)
-
-                # Apply gray background using dataset's mask
-                ref_image = ref_mask * ref_image + (1.0 - ref_mask) * GRAY
-
-                # Compute and save CLIP embedding
-                ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
-                ref_image = torchvision.transforms.Resize(CLIP_H,
-                    interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
-                ref_image = CLIP_INPUT_TRANSFORM(ref_image)
-                ref_image = ref_image[None].to(self.device)
-                with torch.no_grad():
-                    embedding = self.clip_model.encode_image(ref_image)[0].float()
-                embedding /= embedding.norm()
-                ref_embeddings.append(embedding)
-
-            ref_embedding = torch.stack(ref_embeddings).mean(0)
-            ref_embedding /= ref_embedding.norm()
-            self.reference_semantic_embedding = ref_embedding
 
     # This is to average gradients of shared parameters after each iteration
     def average_shared_gradients_between_GPUs(self):
@@ -458,7 +429,7 @@ class Runner:
         data_loader = iter(self.dataset.get_dataloader())
         logging.info("Starting training")
 
-        for iter_i in tqdm(range(res_step)):
+        for iter_i in tqdm(range(res_step), ncols=0):
             start_time = time.time()
 
             is_semantic_consistency_step = self.semantic_consistency_weight > 0 and \
@@ -467,6 +438,37 @@ class Runner:
             # Special semantic consistency update iteration
             if is_semantic_consistency_step:
                 scene_idx = 0
+
+                # Compute reference CLIP embedding
+                ref_embeddings = []
+
+                for ref_image_idx in range(len(self.dataset.images[scene_idx])):
+                    # Load image from dataset, cropped to head
+                    crop = self.dataset.object_bboxes[scene_idx][ref_image_idx]
+                    ref_image, ref_mask = self.dataset.get_image_and_mask(
+                        scene_idx, ref_image_idx, crop=crop)
+
+                    # Apply random background using dataset's mask
+                    background_color = torch.rand(3)
+                    ref_image = \
+                        ref_mask * ref_image + (1.0 - ref_mask) * background_color[None, None]
+
+                    # Compute and save CLIP embedding
+                    ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
+                    ref_image = torchvision.transforms.Resize(CLIP_H,
+                        interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
+                    ref_image = CLIP_INPUT_TRANSFORM(ref_image)
+                    ref_image = ref_image.to(self.device)
+                    with torch.no_grad():
+                        embedding = self.clip_model.encode_image(ref_image[None])[0].float()
+                    embedding /= embedding.norm()
+                    ref_embeddings.append(embedding)
+
+                ref_embedding = torch.stack(ref_embeddings).mean(0)
+                ref_embedding /= ref_embedding.norm()
+                reference_semantic_embedding = ref_embedding
+
+                # Compute CLIP embedding of the rendered shape
                 POSE = torch.tensor([
                     [-2.31622174e-01, -5.49429409e-08,  9.72805917e-01, -5.59038472e+00],
                     [ 1.55864701e-01,  9.87081170e-01,  3.71109620e-02, -9.68393748e-01],
@@ -477,7 +479,8 @@ class Runner:
                     [  0.                 ,   0.                 ,        1.        ]])
 
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                    rendered_rgb = self.render_view_by_pose(0, CLIP_H, CLIP_W, POSE, INTRINSICS)
+                    rendered_rgb = self.render_view_by_pose(
+                        0, CLIP_H, CLIP_W, POSE, INTRINSICS, background_color)
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
                 rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
                 rendered_rgb = rendered_rgb[None].to(self.device)
@@ -486,7 +489,7 @@ class Runner:
                 embedding_of_render = embedding_of_render / embedding_of_render.norm()
 
                 semantic_consistency_loss = \
-                    ((self.reference_semantic_embedding - embedding_of_render) ** 2).mean()
+                    ((reference_semantic_embedding - embedding_of_render) ** 2).mean()
 
                 loss = semantic_consistency_loss
 
@@ -900,7 +903,7 @@ class Runner:
                 'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
             self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
-    def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics):
+    def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics, background_color=None):
         """
         Pose can optionally be obtained from Blender. Open any mesh obtained by running
         this code with `--mode validate_mesh_XX` and export the pose with this plugin:
@@ -919,6 +922,9 @@ class Runner:
         intrinsics
             torch.tensor, float32, shape == (3, 3)
             `npz['intrinsic_mat']`.
+        background_color
+            torch.tensor, float32, shape == (3)
+            RGB, 0..1
         """
         tx = torch.linspace(0, w - 1, w)
         ty = torch.linspace(0, h - 1, h)
@@ -957,10 +963,13 @@ class Runner:
             gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
             gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
             gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
-            print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
-                  f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
+            # print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
+            #       f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
 
-            background_rgb = torch.empty(1, 3).fill_(GRAY).to(self.device) # TODO: optionally None for black bkgd
+            background_rgb = torch.zeros(1, 3)
+            if background_color is not None:
+                background_rgb[0].copy_(background_color)
+            background_rgb = background_rgb.to(self.device)
 
             render_out = self.renderer.render(rays_o_batch,
                                               rays_d_batch,
@@ -1082,7 +1091,7 @@ class Runner:
 
         assert n_frames > 1
         images = []
-        for i in tqdm(range(n_frames)):
+        for i in tqdm(range(n_frames), ncols=0):
             image, normals = self.render_interpolated_view(
                 scene_idx, img_idx_0, img_idx_1,
                 np.sin(((i / (n_frames - 1)) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2)
