@@ -34,6 +34,10 @@ CLIP_INPUT_TRANSFORM = torchvision.transforms.Compose([
         (0.26862954, 0.26130258, 0.27577711)),
 ])
 CLIP_H, CLIP_W = 70, 70
+POSE = torch.tensor([
+    [-2.31622174e-01, -5.49429409e-08,  9.72805917e-01, -5.59038472e+00],
+    [ 1.55864701e-01,  9.87081170e-01,  3.71109620e-02, -9.68393748e-01],
+    [-9.60238278e-01,  1.60221800e-01, -2.28629708e-01, 9.78317243e+00]])
 
 def psnr(color_fine, true_rgb, mask):
     assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
@@ -223,6 +227,9 @@ class Runner:
 
         self.semantic_consistency_every_k_iterations = self.conf.get_int(
             'train.semantic_consistency_every_k_iterations', default=15)
+        self.clip_resolution = self.conf.get_int('train.clip_resolution', default=224)
+        self.semantic_loss_rendering_method = \
+            self.conf.get_string('train.semantic_loss_rendering_method', default='sphere_tracing')
 
         self.mode = args.mode
         self.model_list = []
@@ -399,7 +406,8 @@ class Runner:
             logging.info(f"Loading CLIP")
 
             # Initialize CLIP model
-            self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
+            self.clip_model, _ = clip.load("ViT-B/32", device='cpu') # cpu because we need fp32
+            self.clip_model = self.clip_model.to(self.device)
             self.clip_model.requires_grad_(False)
 
     # This is to average gradients of shared parameters after each iteration
@@ -455,7 +463,9 @@ class Runner:
 
                     # Compute and save CLIP embedding
                     ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
-                    ref_image = torchvision.transforms.Resize(CLIP_H,
+                    # TODO works only with ~square images, improve
+                    assert 0.93 < ref_image.shape[1] / ref_image.shape[2] < 1.07
+                    ref_image = torchvision.transforms.Resize(self.clip_resolution,
                         interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
                     ref_image = CLIP_INPUT_TRANSFORM(ref_image)
                     ref_image = ref_image.to(self.device)
@@ -469,29 +479,25 @@ class Runner:
                 reference_semantic_embedding = ref_embedding
 
                 # Compute CLIP embedding of the rendered shape
-                POSE = torch.tensor([
-                    [-2.31622174e-01, -5.49429409e-08,  9.72805917e-01, -5.59038472e+00],
-                    [ 1.55864701e-01,  9.87081170e-01,  3.71109620e-02, -9.68393748e-01],
-                    [-9.60238278e-01,  1.60221800e-01, -2.28629708e-01, 9.78317243e+00]])
                 INTRINSICS = torch.tensor([
-                    [  3.83333333 * CLIP_H,   0.                 ,  0.49 * CLIP_H   ],
-                    [  0.                 ,   3.83333333 * CLIP_W,  0.49 * CLIP_W   ],
+                    [  3.83333333 * self.clip_resolution,   0.                 ,  0.49 * self.clip_resolution   ],
+                    [  0.                 ,   3.83333333 * self.clip_resolution,  0.49 * self.clip_resolution   ],
                     [  0.                 ,   0.                 ,        1.        ]])
 
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     rendered_rgb = self.render_view_by_pose(
-                        0, CLIP_H, CLIP_W, POSE, INTRINSICS, background_color)
+                        0, self.clip_resolution, self.clip_resolution, POSE, INTRINSICS,
+                        background_color[None], method=self.semantic_loss_rendering_method)
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
                 rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
-                rendered_rgb = rendered_rgb[None].to(self.device)
 
-                embedding_of_render = self.clip_model.encode_image(rendered_rgb)[0].float()
+                embedding_of_render = self.clip_model.encode_image(rendered_rgb[None])[0].float()
                 embedding_of_render = embedding_of_render / embedding_of_render.norm()
 
                 semantic_consistency_loss = \
                     ((reference_semantic_embedding - embedding_of_render) ** 2).mean()
 
-                loss = semantic_consistency_loss
+                loss = self.semantic_consistency_weight * semantic_consistency_loss
 
             # Otherwise, normal NeuS update iteration
             else:
@@ -617,7 +623,7 @@ class Runner:
                 if self.rank == 0:
                     self.writer.add_scalar('Loss/Total', loss, self.iter_step)
                     if is_semantic_consistency_step:
-                        self.writer.add_scalar('Loss/Semantic', loss, self.iter_step)
+                        self.writer.add_scalar('Loss/Semantic', semantic_consistency_loss, self.iter_step)
                     else:
                         self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
                         if self.radiance_grad_weight > 0:
@@ -896,6 +902,20 @@ class Runner:
         render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
         normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)
 
+        # Render side view by sphere tracing
+        PINK = torch.tensor([[255., 192., 203.]]) / 255
+        H, W = 224, 224
+        INTRINSICS_VAL = torch.tensor([
+            [  3.83333333 * H,   0.                 ,  0.49 * H   ],
+            [  0.                 ,   3.83333333 * W,  0.49 * W   ],
+            [  0.                 ,   0.                 ,        1.        ]])
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            val_view_sphere_tracing = self.render_view_by_pose(
+                0, H, W, POSE, INTRINSICS_VAL, PINK)
+
+        val_view_sphere_tracing = cv2.cvtColor(
+            val_view_sphere_tracing.float().cpu().numpy(), cv2.COLOR_BGR2RGB)
+
         if self.rank == 0:
             self.writer.add_image(
                 'Image/Render (val)', render_images, self.iter_step, dataformats='HWC')
@@ -903,12 +923,17 @@ class Runner:
                 'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
             self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
-    def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics, background_color=None):
+            self.writer.add_image(
+                'Image/Render (val sph)', val_view_sphere_tracing,
+                self.iter_step, dataformats='HWC')
+
+    def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics, background_color=None,
+        method='sphere_tracing'):
         """
         Pose can optionally be obtained from Blender. Open any mesh obtained by running
         this code with `--mode validate_mesh_XX` and export the pose with this plugin:
         https://github.com/Cartucho/vision_blender/. The plugin will output two files,
-        'XXXX.npz' and 'camera_info.json'.
+        'XXXX.npz' (denoted `npz` below) and 'camera_info.json'.
 
         scene_idx
             int
@@ -923,12 +948,20 @@ class Runner:
             torch.tensor, float32, shape == (3, 3)
             `npz['intrinsic_mat']`.
         background_color
-            torch.tensor, float32, shape == (3)
+            torch.tensor, float32, shape == (1, 3)
             RGB, 0..1
+        method
+            str
+            'volume_rendering' or 'sphere_tracing'
         """
+        background_rgb = torch.zeros(1, 3) # black
+        if background_color is not None:
+            background_rgb.copy_(background_color)
+        background_rgb = background_rgb.to(self.device)
+
         tx = torch.linspace(0, w - 1, w)
         ty = torch.linspace(0, h - 1, h)
-        pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # w, h, 2
+        pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # h, w, 2
 
         intrinsics_inv = intrinsics.inverse()
 
@@ -947,45 +980,80 @@ class Runner:
         _, pose = load_K_Rt_from_P(None, proj_matrix[:3].numpy())
         pose = torch.tensor(pose)[:3]
 
-        rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w)
+        rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w) # h, w, 3
         near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
-        rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
-        rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
-        near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
-        far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
+        if method == 'volume_rendering':
+            rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
+            rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
+            near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
+            far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
 
-        rgb_all = []
-        normals_all = []
+            rgb_all = []
 
-        total_batches_computed = 0
-        for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
-            gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
-            gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
-            gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
-            # print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
-            #       f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
+            total_batches_computed = 0
+            for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
+                gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
+                gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
+                gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
+                # print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
+                #       f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
 
-            background_rgb = torch.zeros(1, 3)
-            if background_color is not None:
-                background_rgb[0].copy_(background_color)
-            background_rgb = background_rgb.to(self.device)
+                render_out = self.renderer.render(rays_o_batch,
+                                                  rays_d_batch,
+                                                  near_batch,
+                                                  far_batch,
+                                                  scene_idx,
+                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                                  background_rgb=background_rgb,
+                                                  compute_eikonal_loss=False,
+                                                  compute_radiance_grad_loss=False)
 
-            render_out = self.renderer.render(rays_o_batch,
-                                              rays_d_batch,
-                                              near_batch,
-                                              far_batch,
-                                              scene_idx,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                              background_rgb=background_rgb,
-                                              compute_eikonal_loss=False,
-                                              compute_radiance_grad_loss=False)
+                rgb_all.append(render_out['color_fine'])
+                del render_out
 
-            rgb_all.append(render_out['color_fine'])
-            del render_out
+            img_rendered = torch.cat(rgb_all).reshape([h, w, 3]) # float32, 0..1
 
-        img_fine = torch.cat(rgb_all).reshape([h, w, 3]) # float32, 0..1
-        return img_fine
+        elif method == 'sphere_tracing':
+            batch_size = 1024 * 32 # A larger batch size thanks to smaller tasks
+            rays_o = rays_o.to(self.device).reshape(-1, 3).split(batch_size)
+            rays_d = rays_d.to(self.device).reshape(-1, 3).split(batch_size)
+            near = near.to(self.device).reshape(-1).split(batch_size)
+            far = far.to(self.device).reshape(-1).split(batch_size)
+
+            img_rendered = []
+
+            for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
+                depth = near_batch.clone()
+                valid_mask = torch.ones_like(depth, dtype=torch.bool, device=self.device)
+
+                with torch.no_grad():
+                    N_ITERS = 20
+                    for _ in range(N_ITERS):
+                        points = rays_o_batch + rays_d_batch * depth[..., None]
+                        sdf = self.sdf_network.sdf(points, scene_idx) # TODO predict only for valid pts
+                        depth[valid_mask] += sdf[valid_mask][..., 0]
+                        valid_mask[(depth > far_batch) | (depth < 0)] = False
+
+                points = rays_o_batch + rays_d_batch * depth[..., :, None] # batch_size, 3
+                gradients, sdf, feature_vectors = self.sdf_network.gradient(points, scene_idx)
+                radiance = self.color_network(
+                    points, gradients, rays_d_batch, feature_vectors, scene_idx)
+
+                # PyTorch didn't like the inplace operation, so...
+                radiance = radiance * valid_mask[..., None] + background_rgb * (~valid_mask)[..., None]
+                # radiance_with_bkgd = torch.empty_like(radiance)
+                # radiance_with_bkgd[valid_mask] = radiance[valid_mask]
+                # radiance_with_bkgd[~valid_mask] = background_rgb
+
+                img_rendered.append(radiance)
+
+            img_rendered = torch.cat(img_rendered).reshape(h, w, 3)
+
+        else:
+            raise ValueError(f"Unknown rendering method: '{method}'")
+
+        return img_rendered
 
     def render_interpolated_view(self, scene_idx, idx_0, idx_1, ratio, resolution_level):
         """
