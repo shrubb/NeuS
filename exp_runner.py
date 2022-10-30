@@ -158,6 +158,7 @@ class Runner:
         self.save_freq = self.conf.get_int('train.save_freq')
         self.report_freq = self.conf.get_int('train.report_freq')
         self.val_freq = self.conf.get_int('train.val_freq')
+        self.val_sphere_tracing_freq = self.conf.get_int('train.val_sphere_tracing_freq')
         # List of (scene_idx, image_idx) pairs. Example: [[0, 4], [1, 2]].
         # -1 for random. Examples: [-1] or [[0, 4], -1]
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
@@ -230,6 +231,9 @@ class Runner:
         self.clip_resolution = self.conf.get_int('train.clip_resolution', default=224)
         self.semantic_loss_rendering_method = \
             self.conf.get_string('train.semantic_loss_rendering_method', default='sphere_tracing')
+        self.semantic_grad_resolution_level = \
+            self.conf.get_int('train.semantic_grad_resolution_level',
+                default='semantic_grad_resolution_level')
 
         self.mode = args.mode
         self.model_list = []
@@ -487,7 +491,8 @@ class Runner:
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     rendered_rgb = self.render_view_by_pose(
                         0, self.clip_resolution, self.clip_resolution, POSE, INTRINSICS,
-                        background_color[None], method=self.semantic_loss_rendering_method)
+                        background_color[None], method=self.semantic_loss_rendering_method,
+                        grad_resolution_level=self.semantic_grad_resolution_level)
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
                 rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
 
@@ -651,6 +656,9 @@ class Runner:
 
                     if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                         self.save_checkpoint()
+
+                    if self.iter_step % self.val_sphere_tracing_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
+                        self.validate_images_sphere_tracing()
 
                     if self.iter_step % self.val_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                         self.validate_images()
@@ -902,20 +910,6 @@ class Runner:
         render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
         normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)
 
-        # Render side view by sphere tracing
-        PINK = torch.tensor([[255., 192., 203.]]) / 255
-        H, W = 224, 224
-        INTRINSICS_VAL = torch.tensor([
-            [  3.83333333 * H,   0.                 ,  0.49 * H   ],
-            [  0.                 ,   3.83333333 * W,  0.49 * W   ],
-            [  0.                 ,   0.                 ,        1.        ]])
-        with torch.cuda.amp.autocast(enabled=self.use_fp16):
-            val_view_sphere_tracing = self.render_view_by_pose(
-                0, H, W, POSE, INTRINSICS_VAL, PINK)
-
-        val_view_sphere_tracing = cv2.cvtColor(
-            val_view_sphere_tracing.float().cpu().numpy(), cv2.COLOR_BGR2RGB)
-
         if self.rank == 0:
             self.writer.add_image(
                 'Image/Render (val)', render_images, self.iter_step, dataformats='HWC')
@@ -923,12 +917,28 @@ class Runner:
                 'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
             self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
+    def validate_images_sphere_tracing(self):
+        # Render side view by sphere tracing
+        LIGHT_PURPLE = torch.tensor([[255., 192., 203.]]) / 255
+        H, W = 224, 224
+        INTRINSICS_VAL = torch.tensor([
+            [  3.83333333 * H,   0.                 ,  0.49 * H   ],
+            [  0.                 ,   3.83333333 * W,  0.49 * W   ],
+            [  0.                 ,   0.                 ,        1.        ]])
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            val_view_sphere_tracing = self.render_view_by_pose(
+                0, H, W, POSE, INTRINSICS_VAL, LIGHT_PURPLE)
+
+        val_view_sphere_tracing = cv2.cvtColor(
+            val_view_sphere_tracing.float().cpu().numpy(), cv2.COLOR_BGR2RGB)
+
+        if self.rank == 0:
             self.writer.add_image(
                 'Image/Render (val sph)', val_view_sphere_tracing,
                 self.iter_step, dataformats='HWC')
 
     def render_view_by_pose(self, scene_idx, h, w, pose, intrinsics, background_color=None,
-        method='sphere_tracing'):
+        method='sphere_tracing', grad_resolution_level=1):
         """
         Pose can optionally be obtained from Blender. Open any mesh obtained by running
         this code with `--mode validate_mesh_XX` and export the pose with this plugin:
@@ -953,6 +963,10 @@ class Runner:
         method
             str
             'volume_rendering' or 'sphere_tracing'
+        grad_resolution_level
+            int
+            1(default) = require grad for every pixel of output image,
+            2 = for every other row/col etc.
         """
         background_rgb = torch.zeros(1, 3) # black
         if background_color is not None:
@@ -983,43 +997,64 @@ class Runner:
         rays_o, rays_d = self.dataset.gen_rays(pixels, pose, intrinsics_inv, h, w) # h, w, 3
         near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
+        rays_o = rays_o.to(self.device)
+        rays_d = rays_d.to(self.device)
+        near = near.to(self.device)
+        far = far.to(self.device)
+
         if method == 'volume_rendering':
-            rays_o = rays_o.to(self.device).reshape(-1, 3).split(self.batch_size)
-            rays_d = rays_d.to(self.device).reshape(-1, 3).split(self.batch_size)
-            near = near.to(self.device).reshape(-1, 1).split(self.batch_size)
-            far = far.to(self.device).reshape(-1, 1).split(self.batch_size)
+            img_rendered = torch.empty(h, w, 3, device=self.device)
 
-            rgb_all = []
+            grad_mask_ = torch.zeros(h, w, dtype=torch.bool, device=self.device)
+            grad_mask_[::grad_resolution_level, ::grad_resolution_level] = True
 
-            total_batches_computed = 0
-            for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
-                gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
-                gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
-                gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
-                # print(f"Computing batch {total_batches_computed} / {len(rays_o)}, "
-                #       f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
+            for require_grad in (True, False):
+                grad_mask = grad_mask_ if require_grad else ~grad_mask_
 
-                render_out = self.renderer.render(rays_o_batch,
-                                                  rays_d_batch,
-                                                  near_batch,
-                                                  far_batch,
-                                                  scene_idx,
-                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                  background_rgb=background_rgb,
-                                                  compute_eikonal_loss=False,
-                                                  compute_radiance_grad_loss=False)
+                rays_o_ = rays_o[grad_mask].reshape(-1, 3).split(self.batch_size)
+                rays_d_ = rays_d[grad_mask].reshape(-1, 3).split(self.batch_size)
+                near_ = near[grad_mask].reshape(-1, 1).split(self.batch_size)
+                far_ = far[grad_mask].reshape(-1, 1).split(self.batch_size)
 
-                rgb_all.append(render_out['color_fine'])
-                del render_out
+                with contextlib.nullcontext() if require_grad else torch.no_grad():
+                    rgb_all = []
 
-            img_rendered = torch.cat(rgb_all).reshape([h, w, 3]) # float32, 0..1
+                    total_batches_computed = 0
+                    for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o_, rays_d_, near_, far_):
+                        # gpu_total = torch.cuda.get_device_properties(0).total_memory // 1024**2
+                        # gpu_reserved = torch.cuda.memory_reserved(0) // 1024**2
+                        # gpu_allocated = torch.cuda.memory_allocated(0) // 1024**2
+                        # print(f"Computing batch {total_batches_computed} / {len(rays_o_)}, "
+                        #       f"GPU alloc/reserved/total {gpu_allocated}/{gpu_reserved}/{gpu_total} MB"); total_batches_computed += 1
+
+                        render_out = self.renderer.render(rays_o_batch,
+                                                          rays_d_batch,
+                                                          near_batch,
+                                                          far_batch,
+                                                          scene_idx,
+                                                          cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                                          background_rgb=background_rgb,
+                                                          compute_eikonal_loss=False,
+                                                          compute_radiance_grad_loss=False)
+
+                        rgb_all.append(render_out['color_fine'])
+                        del render_out
+
+                    rgb_all = torch.cat(rgb_all) # float32, 0..1
+
+                img_rendered.masked_scatter_(grad_mask[..., None], rgb_all)
 
         elif method == 'sphere_tracing':
+            if grad_resolution_level != 1:
+                raise NotImplementedError(
+                    f"grad_resolution_level is {grad_resolution_level}, but only 1 " \
+                    f"is supported for method == 'sphere_tracing'")
+
             batch_size = 1024 * 32 # A larger batch size thanks to smaller tasks
-            rays_o = rays_o.to(self.device).reshape(-1, 3).split(batch_size)
-            rays_d = rays_d.to(self.device).reshape(-1, 3).split(batch_size)
-            near = near.to(self.device).reshape(-1).split(batch_size)
-            far = far.to(self.device).reshape(-1).split(batch_size)
+            rays_o = rays_o.reshape(-1, 3).split(batch_size)
+            rays_d = rays_d.reshape(-1, 3).split(batch_size)
+            near = near.reshape(-1).split(batch_size)
+            far = far.reshape(-1).split(batch_size)
 
             img_rendered = []
 
