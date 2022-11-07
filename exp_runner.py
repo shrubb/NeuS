@@ -15,7 +15,7 @@ import apex
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
 from pyhocon.converter import HOCONConverter
-import clip
+import clip_utils
 
 import random
 import pathlib
@@ -187,6 +187,26 @@ class Runner:
             return_cameras_only=self.optimize_cameras)
         self.dataset_val = Dataset(self.conf['dataset'], kind='val',
             return_cameras_only=self.optimize_cameras)
+
+        # TODO remove; the following section is for debugg visualization of the reference image
+        """
+        crop = self.dataset.object_bboxes[0][0]
+        ref_image, ref_mask = self.dataset.get_image_and_mask(
+            0, 0, crop=crop)
+
+        # Apply random background using dataset's mask
+        LIGHT_PURPLE = torch.tensor([255., 192., 203.]) / 255
+        background_color = LIGHT_PURPLE
+        ref_image = \
+            ref_mask * ref_image + (1.0 - ref_mask) * background_color[None, None]
+
+        # Compute and save CLIP embedding
+        ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
+        # TODO works only with ~square images, improve
+        assert 0.93 < ref_image.shape[1] / ref_image.shape[2] < 1.07
+
+        ref_image = torch.nn.functional.interpolate(ref_image[None], (224, 224), mode='bicubic')
+        """
 
         self.apply_camera_correction_to_val = self.conf.get_bool(
             'train.apply_camera_correction_to_val', default=False)
@@ -455,9 +475,9 @@ class Runner:
             logging.info(f"Loading CLIP")
 
             # Initialize CLIP model
-            self.clip_model, _ = clip.load("ViT-B/32", device='cpu') # cpu because we need fp32
-            self.clip_model = self.clip_model.to(self.device)
-            self.clip_model.requires_grad_(False)
+            clip_utils.load_vit()
+            self.embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=-1)  # [N,L=50,D]
+            assert not clip_utils.clip_model_vit.training
 
     # This is to average gradients of shared parameters after each iteration
     def average_shared_gradients_between_GPUs(self):
@@ -514,25 +534,20 @@ class Runner:
                     ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
                     # TODO works only with ~square images, improve
                     assert 0.93 < ref_image.shape[1] / ref_image.shape[2] < 1.07
-                    ref_image = torchvision.transforms.Resize(self.clip_resolution,
-                        interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
-                    ref_image = CLIP_INPUT_TRANSFORM(ref_image)
-                    ref_image = ref_image.to(self.device)
-                    with torch.no_grad():
-                        embedding = self.clip_model.encode_image(ref_image[None])[0].float()
-                    embedding /= embedding.norm()
-                    ref_embeddings.append(embedding)
 
-                ref_embedding = torch.stack(ref_embeddings).mean(0)
-                ref_embedding /= ref_embedding.norm()
-                reference_semantic_embedding = ref_embedding
+                    with torch.no_grad():
+                        ref_image = torch.nn.functional.interpolate(ref_image[None], (224, 224), mode='bicubic')
+                        ref_embeddings = self.embed(ref_image)  # [1,L,D]
+
+                    reference_semantic_embedding = ref_embeddings[0, 0]
+                    break
 
                 # Compute CLIP embedding of the rendered shape
                 INTRINSICS = torch.tensor([
-                    [  3.53791131 * self.clip_resolution,   0.                 ,  0.49 * self.clip_resolution   ],
-                    [  0.                 ,   3.53791131 * self.clip_resolution,  0.49 * self.clip_resolution   ],
+                    [  3.2 * self.clip_resolution,   0.                 ,  0.49 * self.clip_resolution   ], # 3.53791131
+                    [  0.                 ,   3.2 * self.clip_resolution,  0.49 * self.clip_resolution   ],
                     [  0.                 ,   0.                 ,        1.        ]])
-                POSE = torch.tensor(random.choice(POSES))
+                POSE = torch.tensor(POSES[0]) #random.choice(POSES))
 
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     rendered_rgb = self.render_view_by_pose(
@@ -540,13 +555,14 @@ class Runner:
                         background_color[None], method=self.semantic_loss_rendering_method,
                         grad_resolution_level=self.semantic_grad_resolution_level)
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
-                rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
 
-                embedding_of_render = self.clip_model.encode_image(rendered_rgb[None])[0].float()
-                embedding_of_render = embedding_of_render / embedding_of_render.norm()
+                rendered_rgb = torch.nn.functional.interpolate(rendered_rgb[None], (224, 224), mode='bicubic')
+                embedding_of_render = self.embed(rendered_rgb)  # [1,L,D]
+                embedding_of_render = embedding_of_render[0, 0]
 
-                semantic_consistency_loss = \
-                    ((reference_semantic_embedding - embedding_of_render) ** 2).mean()
+                semantic_consistency_loss = -torch.cosine_similarity(
+                    reference_semantic_embedding, embedding_of_render, dim=-1)
+                    # ((reference_semantic_embedding - embedding_of_render) ** 2).mean()
 
                 loss = self.semantic_consistency_weight * semantic_consistency_loss
 
@@ -968,10 +984,10 @@ class Runner:
         LIGHT_PURPLE = torch.tensor([[255., 192., 203.]]) / 255
         H, W = 224, 224
         INTRINSICS_VAL = torch.tensor([
-            [  3.53791131 * H,   0.                 ,  0.49 * H   ],
-            [  0.                 ,   3.53791131 * W,  0.49 * W   ],
-            [  0.                 ,   0.                 ,        1.        ]])
-        POSE = torch.tensor(POSES[4]) # left view
+            [  3.2 * H            ,   0.     ,  0.49 * H   ],
+            [  0.                 ,   3.2 * W,  0.49 * W   ],
+            [  0.                 ,   0.     ,        1.   ]])
+        POSE = torch.tensor(POSES[0]) # left view
 
         with torch.cuda.amp.autocast(enabled=self.use_fp16):
             val_view_sphere_tracing = self.render_view_by_pose(
