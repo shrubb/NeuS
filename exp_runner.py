@@ -277,8 +277,19 @@ class Runner:
         self.semantic_loss_rendering_method = \
             self.conf.get_string('train.semantic_loss_rendering_method', default='sphere_tracing')
         self.semantic_grad_resolution_level = \
-            self.conf.get_int('train.semantic_grad_resolution_level',
-                default='semantic_grad_resolution_level')
+            self.conf.get_int('train.semantic_grad_resolution_level', default=1)
+        self.perturb_semantic_camera = self.conf.get_bool(
+            'train.perturb_semantic_camera', default=True)
+        self.semantic_loss_background_color = self.conf.get(
+            'train.semantic_loss_background_color', default="random")
+        assert (
+            type(self.semantic_loss_background_color) is list and \
+            len(self.semantic_loss_background_color) == 3) \
+            or self.semantic_loss_background_color == "random"
+        self.semantic_loss_zoom_min = self.conf.get_float(
+            'train.semantic_loss_zoom_min', default=1.0)
+        self.semantic_loss_zoom_max = self.conf.get_float(
+            'train.semantic_loss_zoom_max', default=2.0)
 
         self.mode = args.mode
         self.model_list = []
@@ -489,8 +500,13 @@ class Runner:
         for iter_i in tqdm(range(res_step), ncols=0):
             start_time = time.time()
 
-            is_semantic_consistency_step = self.semantic_consistency_weight > 0 and \
-                self.iter_step % self.semantic_consistency_every_k_iterations == 0
+            is_semantic_consistency_step = self.semantic_consistency_weight > 0
+            if self.semantic_consistency_every_k_iterations > 0:
+                is_semantic_consistency_step &= \
+                    self.iter_step % self.semantic_consistency_every_k_iterations == 0
+            else:
+                is_semantic_consistency_step &= \
+                    self.iter_step % (-self.semantic_consistency_every_k_iterations) != 0
 
             # Special semantic consistency update iteration
             if is_semantic_consistency_step:
@@ -506,16 +522,35 @@ class Runner:
                         scene_idx, ref_image_idx, crop=crop)
 
                     # Apply random background using dataset's mask
-                    background_color = torch.rand(3)
+                    if self.semantic_loss_background_color == "random":
+                        background_color = torch.rand(3)
+                    else:
+                        background_color = torch.tensor(self.semantic_loss_background_color).float()
                     ref_image = \
                         ref_mask * ref_image + (1.0 - ref_mask) * background_color[None, None]
 
                     # Compute and save CLIP embedding
+                    ref_image = ref_image.flip(2) # BGR -> RGB
                     ref_image = ref_image.permute(2, 0, 1) # HWC -> CHW
+
+                    # Crop tighter to head
+                    zoom_amount = random.random() * \
+                        (self.semantic_loss_zoom_max - self.semantic_loss_zoom_min) + \
+                        self.semantic_loss_zoom_min
+                    pixels_crop_h = round(ref_image.shape[1] * (1 - 1 / zoom_amount) / 2)
+                    pixels_crop_w = round(ref_image.shape[2] * (1 - 1 / zoom_amount) / 2)
+                    if pixels_crop_h > 0:
+                        ref_image = ref_image[:, pixels_crop_h:-pixels_crop_h]
+                    if pixels_crop_w > 0:
+                        ref_image = ref_image[:, :, pixels_crop_w:-pixels_crop_w]
+
                     # TODO works only with ~square images, improve
                     assert 0.93 < ref_image.shape[1] / ref_image.shape[2] < 1.07
                     ref_image = torchvision.transforms.Resize(self.clip_resolution,
                         interpolation=torchvision.transforms.InterpolationMode.NEAREST)(ref_image)
+
+                    ref_image_semantic_for_logging = ref_image.detach().cpu() # CHW, 0..1
+
                     ref_image = CLIP_INPUT_TRANSFORM(ref_image)
                     ref_image = ref_image.to(self.device)
                     with torch.no_grad():
@@ -529,17 +564,30 @@ class Runner:
 
                 # Compute CLIP embedding of the rendered shape
                 INTRINSICS = torch.tensor([
-                    [  3.53791131 * self.clip_resolution,   0.                 ,  0.49 * self.clip_resolution   ],
-                    [  0.                 ,   3.53791131 * self.clip_resolution,  0.49 * self.clip_resolution   ],
+                    [  3.3 * self.clip_resolution,   0.                 ,  0.49 * self.clip_resolution   ],
+                    [  0.                 ,   3.3 * self.clip_resolution,  0.49 * self.clip_resolution   ],
                     [  0.                 ,   0.                 ,        1.        ]])
-                POSE = torch.tensor(random.choice(POSES))
+                # POSE = torch.tensor(random.choice(POSES))
+                # POSE = torch.tensor(POSES[0]) # front
+                # POSE = torch.tensor(POSES[-1]) # front front right
+                POSE = torch.tensor(random.choice(POSES[1:3] + POSES[-2:])) # pm45
+                if self.perturb_semantic_camera:
+                    POSE[:, 3] += (torch.rand(3) - 0.5) * 0.3
+
+                # Crop tighter to head
+                INTRINSICS[0, 0] *= zoom_amount
+                INTRINSICS[1, 1] *= zoom_amount
+                # lift the camera up a bit
+                POSE[1, 3] += 0.22
 
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     rendered_rgb = self.render_view_by_pose(
                         0, self.clip_resolution, self.clip_resolution, POSE, INTRINSICS,
                         background_color[None], method=self.semantic_loss_rendering_method,
                         grad_resolution_level=self.semantic_grad_resolution_level)
+                rendered_rgb = rendered_rgb.flip(2) # BGR -> RGB
                 rendered_rgb = rendered_rgb.permute(2, 0, 1) # HWC -> CHW
+                rendered_image_semantic_for_logging = rendered_rgb.detach().cpu() # CHW, 0..1
                 rendered_rgb = CLIP_INPUT_TRANSFORM(rendered_rgb)
 
                 embedding_of_render = self.clip_model.encode_image(rendered_rgb[None])[0].float()
@@ -547,6 +595,10 @@ class Runner:
 
                 semantic_consistency_loss = \
                     ((reference_semantic_embedding - embedding_of_render) ** 2).mean()
+
+                if self.val_sphere_tracing_freq > 0 and self.iter_step % self.val_sphere_tracing_freq == 0:
+                    logging.info(f"Step {self.iter_step}, semantic L2 distance: " \
+                                 f"{(reference_semantic_embedding - embedding_of_render).norm().item():.3f}")
 
                 loss = self.semantic_consistency_weight * semantic_consistency_loss
 
@@ -675,6 +727,12 @@ class Runner:
                     self.writer.add_scalar('Loss/Total', loss, self.iter_step)
                     if is_semantic_consistency_step:
                         self.writer.add_scalar('Loss/Semantic', semantic_consistency_loss, self.iter_step)
+
+                        if self.val_sphere_tracing_freq > 0 and (self.iter_step + 1) % self.val_sphere_tracing_freq == 0:
+                            self.writer.add_image(
+                                'Image/Render (semantic)',
+                                torch.cat([ref_image_semantic_for_logging, rendered_image_semantic_for_logging], dim=2),
+                                self.iter_step, dataformats='CHW')
                     else:
                         self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
                         if self.radiance_grad_weight > 0:
@@ -703,7 +761,8 @@ class Runner:
                     if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                         self.save_checkpoint()
 
-                    if self.iter_step % self.val_sphere_tracing_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
+                    if self.val_sphere_tracing_freq > 0 and \
+                       self.iter_step % self.val_sphere_tracing_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                         self.validate_images_sphere_tracing()
 
                     if self.iter_step % self.val_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
@@ -968,10 +1027,10 @@ class Runner:
         LIGHT_PURPLE = torch.tensor([[255., 192., 203.]]) / 255
         H, W = 224, 224
         INTRINSICS_VAL = torch.tensor([
-            [  3.53791131 * H,   0.                 ,  0.49 * H   ],
-            [  0.                 ,   3.53791131 * W,  0.49 * W   ],
+            [  3.3 * H,   0.                 ,  0.49 * H   ],
+            [  0.                 ,   3.3 * W,  0.49 * W   ],
             [  0.                 ,   0.                 ,        1.        ]])
-        POSE = torch.tensor(POSES[4]) # left view
+        POSE = torch.tensor(POSES[4]) # [4] left view
 
         with torch.cuda.amp.autocast(enabled=self.use_fp16):
             val_view_sphere_tracing = self.render_view_by_pose(
