@@ -33,7 +33,7 @@ CLIP_INPUT_TRANSFORM = torchvision.transforms.Compose([
         (0.48145466, 0.4578275, 0.40821073),
         (0.26862954, 0.26130258, 0.27577711)),
 ])
-POSES = [
+POSES = [ # clockwise
     [[ 9.13055420e-01, -1.76651618e-08,  4.07835543e-01,  1.66675574e-02], # front
      [-3.41649936e-03,  9.99964893e-01,  7.64884520e-03, -1.25894707e+00],
      [-4.07821238e-01, -8.37718882e-03,  9.13023353e-01,  5.17910280e+00],],
@@ -181,7 +181,11 @@ class Runner:
 
         self.optimize_cameras = not 'cameras' in self.conf.get_list(
             'train.parts_to_freeze', default=['cameras'])
-        logging.info(f"optimize_cameras is {self.optimize_cameras}")
+        self.share_cameras_correction = self.conf.get_bool(
+            'train.share_cameras_correction', default=False)
+        logging.info(
+            f"Will optimize cameras? {self.optimize_cameras}" + self.optimize_cameras * \
+            f", will share cameras' correction? {self.share_cameras_correction}")
 
         self.dataset = Dataset(self.conf['dataset'], kind='train',
             return_cameras_only=self.optimize_cameras)
@@ -203,7 +207,7 @@ class Runner:
         self.save_freq = self.conf.get_int('train.save_freq')
         self.report_freq = self.conf.get_int('train.report_freq')
         self.val_freq = self.conf.get_int('train.val_freq')
-        self.val_sphere_tracing_freq = self.conf.get_int('train.val_sphere_tracing_freq')
+        self.val_sphere_tracing_freq = self.conf.get_int('train.val_sphere_tracing_freq', default=0)
         # List of (scene_idx, image_idx) pairs. Example: [[0, 4], [1, 2]].
         # -1 for random. Examples: [-1] or [[0, 4], -1]
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
@@ -218,6 +222,8 @@ class Runner:
             dict(self.conf.get('train.scenewise_layers_optimizer_extra_args', default={}))
         self.cameras_optimizer_extra_args = \
             dict(self.conf.get('train.cameras_optimizer_extra_args', default={}))
+        self.disable_camera_optimization_until = \
+            self.conf.get_float('train.disable_camera_optimization_until', default=0.0)
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
@@ -301,7 +307,9 @@ class Runner:
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=current_num_scenes).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
-        self.trainable_camera_params = TrainableCameraParams([len(images) for images in self.dataset.images]).to(self.device)
+        self.trainable_camera_params = TrainableCameraParams(
+            [len(images) for images in self.dataset.images],
+            share_extrinsics=self.share_cameras_correction).to(self.device)
 
         def get_optimizer(parts_to_train):
             """
@@ -352,6 +360,10 @@ class Runner:
                     return self.trainable_camera_params
                 else:
                     raise ValueError(f"Unknown 'parts_to_train': {part_name}")
+
+            # Enable grad only `parts_to_train`
+            for part_name in PARTS_TO_TRAIN_ALL:
+                get_module_to_train(part_name).requires_grad_(part_name in parts_to_train)
 
             parameter_groups = []
 
@@ -829,9 +841,10 @@ class Runner:
             # TEMPORARY experiment
             if g['group_name'].startswith('cameras-'):
                 def cameras_lr_factor(progress):
-                    LEFT = 0.7
-                    RIGHT = 0.71
-                    return 1.0 # max(0, min(1.0, (progress - LEFT) / (RIGHT - LEFT)))
+                    return 0.0 if progress < self.disable_camera_optimization_until else 1.0
+                    # LEFT = 0.7
+                    # RIGHT = 0.71
+                    # return 1.0 # max(0, min(1.0, (progress - LEFT) / (RIGHT - LEFT)))
 
                 g['lr'] *= cameras_lr_factor(progress)
             else:

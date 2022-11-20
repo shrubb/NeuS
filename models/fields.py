@@ -823,18 +823,27 @@ class SingleVarianceNetwork(nn.Module):
 
 class TrainableCameraParams(nn.Module):
     """
-    Trainable correction for `num_cameras` sets of camera parameters.
-    Intrinsics are shared between cameras (so only 1 matrix for all cameras is learned).
+    Trainable correction for several sets of camera parameters for several scenes.
+    Intrinsics are shared between cameras in a scene; optionally, extrinsics can be shared too.
     1 trainable parameter for intrinsics (focal distance multiplicative delta)
     and 6 for extrinsics (se(3) correction = 3 translation amounts + 3 rotation angles).
     """
-    def __init__(self, num_cameras_per_scene):
+    def __init__(self, num_cameras_per_scene, share_extrinsics=False):
         """
         num_cameras_per_scene:
             list of int
             length = number of scenes in the dataset
+        share_extrinsics:
+            bool
+            If True, learn only one extrinsic matrix per scene (and discard the
+            contents of `num_cameras_per_scene`).
         """
         super().__init__()
+
+        if share_extrinsics:
+            num_cameras_per_scene = [1] * len(num_cameras_per_scene)
+        self.share_extrinsics = share_extrinsics
+
         self.log_focal_dist_delta = nn.ParameterList(
             [nn.Parameter(torch.zeros([])) for _ in range(len(num_cameras_per_scene))])
         self.pose_se3_delta = nn.ParameterList([
@@ -846,6 +855,7 @@ class TrainableCameraParams(nn.Module):
             int
         camera_idx
             int
+            No effect if was constructed with `share_extrinsics=True`.
         intrinsics_init
             torch.FloatTensor, shape == (4, 4)
         pose_init
@@ -857,6 +867,9 @@ class TrainableCameraParams(nn.Module):
             torch.FloatTensor, shape == (4, 4)
             The above set of camera parameters but with trainable corrections applied.
         """
+        if self.share_extrinsics:
+            camera_idx = 0
+
         intrinsics_new = intrinsics_init.clone()
         focal_dist_delta = self.log_focal_dist_delta[scene_idx].exp()
         intrinsics_new[0, 0] *= focal_dist_delta
