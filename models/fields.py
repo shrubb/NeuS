@@ -21,8 +21,7 @@ class LowRankMultiLinear(nn.Module):
         super().__init__()
         assert rank > 0
         self.use_bias = use_bias
-        if weight_norm:
-            raise NotImplementedError("weight_norm + low-rank Linear layers")
+        self.use_weight_norm = weight_norm
 
         self.linear_layers = nn.ModuleList([nn.Linear(in_dim, out_dim) for _ in range(n_scenes)])
 
@@ -32,8 +31,20 @@ class LowRankMultiLinear(nn.Module):
                 torch.empty(parameter.shape + (rank + use_bias,)))
 
         self.basis_weights = nn.ParameterDict(basis_weights) # 'weight': out_dim x in_dim x rank[+1]
-        self.combination_coeffs = nn.Parameter(
-            torch.empty(n_scenes, rank)) # n_scenes x rank
+        self.combination_coeffs = nn.ParameterList(
+            [nn.Parameter(torch.empty(rank)) for _ in range(n_scenes)]) # n_scenes x rank
+
+        self.reset_parameters_()
+        self.finetuning = False
+
+        if self.use_weight_norm:
+            with torch.no_grad():
+                # Create one learnable tensor for norm ("g").
+                # Initialize it with approximate existing norm:
+                weight = self.get_parameter('weight', 0)
+
+                self.weight_norm_g = torch.nn.Parameter(
+                    torch.norm_except_dim(weight, 2, dim=0))
 
         # A an application of PyTorch 'parametrization' functionality
         class LowRankWeight(nn.Module):
@@ -41,7 +52,7 @@ class LowRankMultiLinear(nn.Module):
                 multi_linear_module: LowRankMultiLinear, parameter_name: str, scene_idx: int):
                 super().__init__()
 
-                # don't register, just store a reference
+                # don't "register as submodule", just store a reference
                 self.__dict__['multi_linear_module'] = multi_linear_module
 
                 self.parameter_name = parameter_name
@@ -58,24 +69,33 @@ class LowRankMultiLinear(nn.Module):
                 parameters only from external tensors (namely, from `self.multi_linear_module`).
                 This is ensured by `right_inverse()` having empty output.
                 """
-                # (rank)
-                combination_coeffs = self.multi_linear_module.combination_coeffs[self.scene_idx]
-                # (out_dim x in_dim x rank[+1]) - in case `parameter_name` is 'weight'
-                parameter_basis = self.multi_linear_module.basis_weights[self.parameter_name]
+                param = self.multi_linear_module.get_parameter(self.parameter_name, self.scene_idx)
 
-                # (out_dim x in_dim)
-                if self.multi_linear_module.use_bias:
-                    return parameter_basis[..., :-1] @ combination_coeffs + parameter_basis[..., -1]
-                else:
-                    return parameter_basis @ combination_coeffs
+                if parameter_name == 'weight' and self.multi_linear_module.use_weight_norm:
+                    param = torch._weight_norm(param, self.multi_linear_module.weight_norm_g, 0)
+
+                return param
 
         for parameter_name, _ in list(self.linear_layers[0].named_parameters()):
             for scene_idx, layer in enumerate(self.linear_layers):
                 nn.utils.parametrize.register_parametrization(
                     layer, parameter_name, LowRankWeight(self, parameter_name, scene_idx))
 
-        self.reset_parameters_()
-        self.finetuning = False
+    def get_parameter(self, parameter_name, scene_idx):
+        """
+        Compute the linear combination and return the final parameter value (before weight norm).
+        Used by `LowRankWeight` parametrization.
+        """
+        # (rank)
+        combination_coeffs = self.combination_coeffs[scene_idx]
+        # (out_dim x in_dim x rank[+1]) - in case `parameter_name` is 'weight'
+        parameter_basis = self.basis_weights[parameter_name]
+
+        if self.use_bias:
+            return parameter_basis[..., :-1] @ combination_coeffs + parameter_basis[..., -1]
+        else:
+            # (out_dim x in_dim)
+            return parameter_basis @ combination_coeffs
 
     def __getitem__(self, scene_idx):
         return self.linear_layers[scene_idx]
@@ -102,7 +122,8 @@ class LowRankMultiLinear(nn.Module):
                 self.basis_weights['bias'][..., -1].fill_(0)
 
         # Initialize linear combination coefficients
-        nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
+        for x in self.combination_coeffs:
+            nn.init.kaiming_uniform_(x[None], nonlinearity='linear')
 
     def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
@@ -116,15 +137,15 @@ class LowRankMultiLinear(nn.Module):
         """
         if algorithm == 'pick':
             if scene_idx == -1:
-                new_combination_coeffs = self.combination_coeffs[:1] * 0
+                new_combination_coeffs = self.combination_coeffs[0] * 0
             else:
-                new_combination_coeffs = self.combination_coeffs[scene_idx:scene_idx+1]
+                new_combination_coeffs = self.combination_coeffs[scene_idx]
         elif algorithm == 'average':
-            new_combination_coeffs = self.combination_coeffs.mean(0, keepdim=True)
+            new_combination_coeffs = torch.stack(list(self.combination_coeffs)).mean(0)
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-        self.combination_coeffs = nn.Parameter(new_combination_coeffs)
+        self.combination_coeffs = nn.ParameterList([nn.Parameter(new_combination_coeffs)])
         self.linear_layers = self.linear_layers[:1]
         self.finetuning = True
 
@@ -137,9 +158,10 @@ class LowRankMultiLinear(nn.Module):
         if which_layers == 'all':
             return super().parameters()
         elif which_layers == 'scenewise':
-            return [self.combination_coeffs] if self.finetuning else []
+            return list(self.combination_coeffs) if scene_idx is None \
+                else [self.combination_coeffs[scene_idx]]
         elif which_layers == 'shared':
-            return list(self.basis_weights.values()) if self.finetuning else super().parameters()
+            return list(self.basis_weights.values()) + [self.weight_norm_g]
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
