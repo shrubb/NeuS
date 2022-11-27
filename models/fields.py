@@ -71,7 +71,7 @@ class LowRankMultiLinear(nn.Module):
                 """
                 param = self.multi_linear_module.get_parameter(self.parameter_name, self.scene_idx)
 
-                if parameter_name == 'weight' and self.multi_linear_module.use_weight_norm:
+                if self.parameter_name == 'weight' and self.multi_linear_module.use_weight_norm:
                     param = torch._weight_norm(param, self.multi_linear_module.weight_norm_g, 0)
 
                 return param
@@ -161,7 +161,10 @@ class LowRankMultiLinear(nn.Module):
             return list(self.combination_coeffs) if scene_idx is None \
                 else [self.combination_coeffs[scene_idx]]
         elif which_layers == 'shared':
-            return list(self.basis_weights.values()) + [self.weight_norm_g]
+            retval = list(self.basis_weights.values())
+            if self.use_weight_norm:
+                retval += [self.weight_norm_g]
+            return retval
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
@@ -841,7 +844,7 @@ class SingleVarianceNetwork(nn.Module):
             any type
             No effect. For compatibility only.
         """
-        pass # self.reset_parameters_(0.365)
+        pass
 
 class TrainableCameraParams(nn.Module):
     """
