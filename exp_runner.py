@@ -882,6 +882,14 @@ class Runner:
                     state_dict[new_tensor_name] = state_dict[tensor_name]
                     del state_dict[tensor_name]
 
+            # backward compatibility:
+            # replace '*.combination_coeffs' (old convention) with '*.combination_coeffs.[i]'
+            for tensor_name in list(state_dict.keys()):
+                if tensor_name.endswith('combination_coeffs'):
+                    for idx, coeffs_vector in enumerate(state_dict[tensor_name]):
+                        state_dict[f'{tensor_name}.{idx}'] = coeffs_vector
+                    del state_dict[tensor_name]
+
             module.load_state_dict(state_dict)
             # missing_keys, unexpected_keys = module.load_state_dict(state_dict, strict=False)
 
