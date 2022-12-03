@@ -526,17 +526,33 @@ class RenderingNetwork(nn.Module):
                 raise ValueError(
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
 
+            def geometric_like_init_(weight, bias_):
+                torch.nn.init.constant_(bias_, 0.0)
+                torch.nn.init.normal_(weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+
+            def init_and_maybe_weight_norm(layer):
+                geometric_like_init_(layer.weight, layer.bias)
+                return maybe_weight_norm(layer)
+
             if layer_is_scene_specific:
                 logging.info(f"Radiance: layer {l} is scene-specific")
                 if scenewise_core_rank in (None, 0):
                     lin = nn.ModuleList(
-                        [maybe_weight_norm(nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
+                        [init_and_maybe_weight_norm(
+                            nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
                 else:
                     lin = LowRankMultiLinear(
-                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm, scenewise_bias)
+                        n_scenes, in_dim, out_dim, scenewise_core_rank,
+                        weight_norm, scenewise_bias)
+
+                    for i in range(scenewise_core_rank):
+                        geometric_like_init_(
+                            lin.basis_weights['weight'][..., i],
+                            lin.basis_weights['bias'][..., i])
+
                 total_scene_specific_layers += 1
             else:
-                lin = maybe_weight_norm(nn.Linear(in_dim, out_dim))
+                lin = init_and_maybe_weight_norm(nn.Linear(in_dim, out_dim))
 
             self.linear_layers.append(lin)
 
