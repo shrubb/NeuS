@@ -268,12 +268,16 @@ class SDFNetwork(nn.Module):
             def geometric_init_(weight, bias_):
                 if l == self.num_layers - 1:
                     if not inside_outside:
-                        torch.nn.init.normal_(weight, mean=np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
-                        torch.nn.init.constant_(bias_, -bias)
+                        torch.nn.init.normal_(weight[:1], mean=np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
+                        torch.nn.init.constant_(bias_[:1], -bias)
                     else:
-                        torch.nn.init.normal_(weight, mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
-                        torch.nn.init.constant_(bias_, bias)
-                elif multires > 0 and l == 0:
+                        torch.nn.init.normal_(weight[:1], mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
+                        torch.nn.init.constant_(bias_[:1], bias)
+
+                    weight = weight[1:]
+                    bias_ = bias_[1:]
+
+                if multires > 0 and l == 0:
                     torch.nn.init.constant_(bias_, 0.0)
                     torch.nn.init.constant_(weight[:, 3:], 0.0)
                     torch.nn.init.normal_(weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
