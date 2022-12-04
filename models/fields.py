@@ -12,7 +12,8 @@ class LowRankMultiLinear(nn.Module):
     """N linear layers whose weights are linearly regressed at forward pass from smaller
     matrices, leading to "lower rank" (lower DoF) parametrization.
     """
-    def __init__(self, n_scenes, in_dim, out_dim, rank, weight_norm=False, use_bias=False):
+    def __init__(self,
+        n_scenes, in_dim, out_dim, rank, weight_norm=True, use_bias=False):
         """
         rank:
             How many instances of weights (`P`) are learned.
@@ -33,18 +34,12 @@ class LowRankMultiLinear(nn.Module):
         self.basis_weights = nn.ParameterDict(basis_weights) # 'weight': out_dim x in_dim x rank[+1]
         self.combination_coeffs = nn.ParameterList(
             [nn.Parameter(torch.empty(rank)) for _ in range(n_scenes)]) # n_scenes x rank
+        if self.use_weight_norm:
+            # Create one learnable tensor for norm ("g").
+            self.weight_norm_g = torch.nn.Parameter(torch.empty(out_dim, 1))
 
         self.reset_parameters_()
         self.finetuning = False
-
-        if self.use_weight_norm:
-            with torch.no_grad():
-                # Create one learnable tensor for norm ("g").
-                # Initialize it with approximate existing norm:
-                weight = self.get_parameter('weight', 0)
-
-                self.weight_norm_g = torch.nn.Parameter(
-                    torch.norm_except_dim(weight, 2, dim=0))
 
         # A an application of PyTorch 'parametrization' functionality
         class LowRankWeight(nn.Module):
@@ -100,30 +95,41 @@ class LowRankMultiLinear(nn.Module):
     def __getitem__(self, scene_idx):
         return self.linear_layers[scene_idx]
 
-    def reset_parameters_(self):
-        _, in_dim, rank = self.basis_weights['weight'].shape
-        if self.use_bias:
-            rank -= 1
-        assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
+    def reset_weightnorm_(self):
+        if not self.use_weight_norm:
+            raise RuntimeError(f"reset_weightnorm_() used when use_weight_norm=False")
 
-        # Initialize weight
-        for i in range(rank):
-            # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
-            nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i], a=np.sqrt(5))
-        if self.use_bias:
-            with torch.no_grad():
+        with torch.no_grad():
+            # Initialize norm for weight_norm with approximate current norm
+            weight = self.get_parameter('weight', 0)
+            self.weight_norm_g[:] = torch.norm_except_dim(weight, 2, dim=0)
+
+    def reset_parameters_(self):
+        with torch.no_grad():
+            _, in_dim, rank = self.basis_weights['weight'].shape
+            if self.use_bias:
+                rank -= 1
+            assert rank + self.use_bias == self.basis_weights['weight'].shape[-1]
+
+            # Initialize weight
+            for i in range(rank):
+                nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i])
+            if self.use_bias:
                 self.basis_weights['weight'][..., -1].fill_(0)
 
-        # Initialize bias
-        bound = 1 / np.sqrt(in_dim)
-        nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
-        if self.use_bias:
-            with torch.no_grad():
+            # Initialize bias
+            # bound = 1 / np.sqrt(in_dim)
+            nn.init.zeros_(self.basis_weights['bias'])
+            if self.use_bias:
                 self.basis_weights['bias'][..., -1].fill_(0)
 
-        # Initialize linear combination coefficients
-        for x in self.combination_coeffs:
-            nn.init.kaiming_uniform_(x[None], nonlinearity='linear')
+            # Initialize linear combination coefficients
+            for x in self.combination_coeffs:
+                desired_stddev = 1 / np.sqrt(rank)
+                bound = desired_stddev * np.sqrt(3)
+                nn.init.uniform_(x, -bound, bound)
+
+            self.reset_weightnorm_()
 
     def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
         """
@@ -274,10 +280,10 @@ class SDFNetwork(nn.Module):
                         torch.nn.init.normal_(weight[:1], mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
                         torch.nn.init.constant_(bias_[:1], bias)
 
-                    weight = weight[1:]
-                    bias_ = bias_[1:]
-
-                if multires > 0 and l == 0:
+                    # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
+                    torch.nn.init.kaiming_uniform_(weight[1:])
+                    torch.nn.init.zeros_(bias_[1:])
+                elif multires > 0 and l == 0:
                     torch.nn.init.constant_(bias_, 0.0)
                     torch.nn.init.constant_(weight[:, 3:], 0.0)
                     torch.nn.init.normal_(weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
@@ -303,7 +309,8 @@ class SDFNetwork(nn.Module):
                     lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 else:
                     lin = LowRankMultiLinear(
-                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm, scenewise_bias)
+                        n_scenes, in_dim, out_dim, scenewise_core_rank,
+                        weight_norm, scenewise_bias)
 
                     if geometric_init:
                         for i in range(scenewise_core_rank):
@@ -314,6 +321,9 @@ class SDFNetwork(nn.Module):
                             with torch.no_grad():
                                 lin.basis_weights['weight'][..., -1].fill_(0)
                                 lin.basis_weights['bias'][..., -1].fill_(0)
+
+                        if lin.use_weight_norm:
+                            lin.reset_weightnorm_()
 
                 total_scene_specific_layers += 1
             else:
@@ -526,12 +536,9 @@ class RenderingNetwork(nn.Module):
                 raise ValueError(
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
 
-            def geometric_like_init_(weight, bias_):
-                torch.nn.init.constant_(bias_, 0.0)
-                torch.nn.init.normal_(weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-
             def init_and_maybe_weight_norm(layer):
-                geometric_like_init_(layer.weight, layer.bias)
+                nn.init.kaiming_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
                 return maybe_weight_norm(layer)
 
             if layer_is_scene_specific:
@@ -544,11 +551,6 @@ class RenderingNetwork(nn.Module):
                     lin = LowRankMultiLinear(
                         n_scenes, in_dim, out_dim, scenewise_core_rank,
                         weight_norm, scenewise_bias)
-
-                    for i in range(scenewise_core_rank):
-                        geometric_like_init_(
-                            lin.basis_weights['weight'][..., i],
-                            lin.basis_weights['bias'][..., i])
 
                 total_scene_specific_layers += 1
             else:
@@ -570,6 +572,8 @@ class RenderingNetwork(nn.Module):
                 "Please address this.")
 
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
+        feature_vectors = self.relu(feature_vectors)
+
         if self.embed_fn is not None:
             points = self.embed_fn(points)
 
