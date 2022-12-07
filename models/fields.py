@@ -191,6 +191,8 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
+                 layer_norm=False,
+                 layer_norm_learnable=True,
                  inside_outside=False):
         """
         n_scenes
@@ -217,6 +219,9 @@ class SDFNetwork(nn.Module):
             - 'all'
         """
         super().__init__()
+        self.use_layer_norm = layer_norm
+        if self.use_layer_norm:
+            self.layer_norms = nn.ModuleList([nn.Identity()]) # don't normalize first layer's input
 
         self.scenewise_split_type = scenewise_split_type
         if scenewise_split_type in ('append_half', 'prepend_half'):
@@ -331,6 +336,11 @@ class SDFNetwork(nn.Module):
 
             self.linear_layers.append(lin)
 
+            if self.use_layer_norm and l > 0:
+                # We apply layer norm to layer's input (i.e. after activation)
+                self.layer_norms.append(nn.LayerNorm(
+                    dims[l], 1e-6, elementwise_affine=layer_norm_learnable))
+
         logging.info(
             f"SDF network got {total_scene_specific_layers} (out of " \
             f"{self.num_layers}) scene-specific layers")
@@ -366,6 +376,9 @@ class SDFNetwork(nn.Module):
             if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips_and_last' \
                 and self.dims[l] == self.dims[l + 1]:
                 skip_connection = x
+
+            if self.use_layer_norm:
+                x = self.layer_norms[l](x)
 
             x = lin(x)
 
@@ -458,6 +471,8 @@ class SDFNetwork(nn.Module):
                     retval += list(module.parameters(which_layers, scene_idx))
                 else:
                     raise RuntimeError(f"Unexpected module type: {module}")
+            if self.use_layer_norm:
+                retval += self.layer_norms.parameters()
             return retval
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
@@ -478,10 +493,15 @@ class RenderingNetwork(nn.Module):
                  scenewise_core_rank=None,
                  scenewise_bias=False,
                  weight_norm=True,
+                 layer_norm=False,
+                 layer_norm_learnable=True,
                  multires=0,
                  multires_view=0,
                  squeeze_out=True):
         super().__init__()
+        self.use_layer_norm = layer_norm
+        if self.use_layer_norm:
+            self.layer_norms = nn.ModuleList([])
 
         self.mode = mode
         self.squeeze_out = squeeze_out
@@ -558,6 +578,11 @@ class RenderingNetwork(nn.Module):
 
             self.linear_layers.append(lin)
 
+            if self.use_layer_norm:
+                # We apply layer norm to layer's input (i.e. after activation)
+                self.layer_norms.append(nn.LayerNorm(
+                    dims[l], 1e-6, elementwise_affine=layer_norm_learnable))
+
         logging.info(
             f"Rendering network got {total_scene_specific_layers} (out of " \
             f"{self.num_layers}) scene-specific layers")
@@ -605,6 +630,9 @@ class RenderingNetwork(nn.Module):
                 elif self.scenewise_split_type == 'interleave_with_skips_and_last' \
                     and self.dims[l] == self.dims[l + 1]:
                     skip_connection = x
+
+            if self.use_layer_norm:
+                x = self.layer_norms[l](x)
 
             x = lin(x)
 
@@ -710,6 +738,8 @@ class RenderingNetwork(nn.Module):
                     retval += list(module.parameters(which_layers, scene_idx))
                 else:
                     raise RuntimeError(f"Unexpected module type: {module}")
+            if self.use_layer_norm:
+                retval += self.layer_norms.parameters()
             return retval
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
