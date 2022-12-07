@@ -480,7 +480,8 @@ class RenderingNetwork(nn.Module):
                  weight_norm=True,
                  multires=0,
                  multires_view=0,
-                 squeeze_out=True):
+                 squeeze_out=True,
+                 activation='relu'):
         super().__init__()
 
         self.mode = mode
@@ -562,7 +563,12 @@ class RenderingNetwork(nn.Module):
             f"Rendering network got {total_scene_specific_layers} (out of " \
             f"{self.num_layers}) scene-specific layers")
 
-        self.relu = nn.ReLU()
+        if activation == 'relu':
+            self.activation = nn.ReLU()
+        elif activation == 'softplus':
+            self.activation = nn.Softplus(beta=100)
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
         self.dims = dims
 
         # TODO restructure `parameters()` in all custom classes to get rid of this dirty hack
@@ -572,7 +578,7 @@ class RenderingNetwork(nn.Module):
                 "Please address this.")
 
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
-        feature_vectors = self.relu(feature_vectors)
+        feature_vectors = self.activation(feature_vectors)
 
         if self.embed_fn is not None:
             points = self.embed_fn(points)
@@ -612,7 +618,7 @@ class RenderingNetwork(nn.Module):
                 x += skip_connection
 
             if l < self.num_layers - 1:
-                x = self.relu(x)
+                x = self.activation(x)
 
         if self.squeeze_out:
             x = torch.sigmoid(x)
