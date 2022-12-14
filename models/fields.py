@@ -540,6 +540,10 @@ class RenderingNetwork(nn.Module):
             def init_and_maybe_weight_norm(layer):
                 nn.init.kaiming_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
+                if l == self.num_layers - 1:
+                    assert d_hidden == 256, NotImplementedError()
+                    # Magic scale for d_hidden=256 so that outputs are roughly in [-3; 3]
+                    with torch.no_grad(): layer.weight *= 20.0
                 return maybe_weight_norm(layer)
 
             if layer_is_scene_specific:
@@ -585,6 +589,14 @@ class RenderingNetwork(nn.Module):
 
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
+
+        # TODO un-hardcode this hack
+        # Scale pts & viewdirs' to ~match `feature_vectors` (assume std=0.07)
+        FEATURES_STD_ESTIMATE = 0.07
+        POINTS_STD_ESTIMATE = 0.65
+        points    = points    * (FEATURES_STD_ESTIMATE / POINTS_STD_ESTIMATE)
+        view_dirs = view_dirs * (FEATURES_STD_ESTIMATE / POINTS_STD_ESTIMATE)
+        normals   = normals   * (FEATURES_STD_ESTIMATE / POINTS_STD_ESTIMATE)
 
         rendering_input = None
 
