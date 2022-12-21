@@ -357,7 +357,9 @@ class NeuSRenderer:
     def render(self,
         rays_o, rays_d, near, far, scene_idx,
         perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0,
-        compute_eikonal_loss=True, compute_radiance_grad_loss=False):
+        compute_eikonal_loss=True, compute_radiance_grad_loss=False, render_outside=True):
+
+        n_outside = self.n_outside if render_outside else 0
 
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
@@ -365,9 +367,9 @@ class NeuSRenderer:
         z_vals = near + (far - near) * z_vals[None, :]
 
         z_vals_outside = None
-        if self.n_outside > 0:
+        if n_outside > 0:
             z_vals_outside = torch.linspace(
-                1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside, device=z_vals.device)
+                1e-3, 1.0 - 1.0 / (n_outside + 1.0), n_outside, device=z_vals.device)
 
         n_samples = self.n_samples
         perturb = self.perturb
@@ -378,14 +380,14 @@ class NeuSRenderer:
             t_rand = (torch.rand([batch_size, 1], device=z_vals.device) - 0.5)
             z_vals = z_vals + t_rand * 2.0 / self.n_samples
 
-            if self.n_outside > 0:
+            if n_outside > 0:
                 mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
                 upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
                 lower = torch.cat([z_vals_outside[..., :1], mids], -1)
                 t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]], device=z_vals.device)
                 z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
 
-        if self.n_outside > 0:
+        if n_outside > 0:
             z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
 
         background_alpha = None
@@ -415,7 +417,7 @@ class NeuSRenderer:
             n_samples = self.n_samples + self.n_importance
 
         # Background model
-        if self.n_outside > 0:
+        if n_outside > 0:
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
             ret_outside = self.render_core_outside(

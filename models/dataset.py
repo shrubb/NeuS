@@ -160,7 +160,7 @@ class Dataset(torch.utils.data.Dataset):
                 try:
                     return [i for i, x in enumerate(images_list) if x.with_suffix('').name == image_file_name][0]
                 except IndexError as exc:
-                    raise RuntimeError(f"Asked to pick image '{image_file_name}', couldn't find it") from exc
+                    raise RuntimeError(f"Asked to pick image '{image_file_name}' from '{root_dir}', couldn't find it") from exc
 
             image_idxs_to_pick = list(map(get_image_idx, images_to_pick))
 
@@ -230,6 +230,14 @@ class Dataset(torch.utils.data.Dataset):
         if not all(
             images.shape[1:3] == (self.H, self.W) for images in self.images if images != []):
             raise NotImplementedError("Images of different sizes not supported yet")
+
+        #  4 = 3 steps finetuning, 1 step metalearning
+        # -3 = 1 step finetuning, 2 steps metalearning
+        #  1 = meta-learning only
+        # -1 = finetuning only
+        # 0 = sample uniformly
+        self.finetuning_metalearn_every = \
+            conf.get_int('finetuning_metalearn_every', default=0)
 
         # Region of interest to **extract mesh**
         self.object_bbox_min = np.float32([-1.01, -1.01, -1.01])
@@ -487,21 +495,45 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_dataloader(self):
         class InfiniteRandomSampler(torch.utils.data.Sampler):
-            def __init__(self, dataset_length):
+            def __init__(self, dataset_length, finetuning_metalearn_every):
                 self.dataset_length = dataset_length
+                self.finetuning_metalearn_every = finetuning_metalearn_every
 
             def __len__(self):
                 return 10 ** 20
 
             def __iter__(self):
-                def indices_generator(dataset_length):
+                def uniform_indices_generator(dataset_length):
                     indices = list(range(dataset_length))
 
                     while True:
                         random.shuffle(indices)
                         yield from indices
 
-                return indices_generator(self.dataset_length)
+                if self.finetuning_metalearn_every == 0:
+                    return uniform_indices_generator(self.dataset_length)
+                else:
+                    def alternating_indices_generator(dataset_length, finetuning_metalearn_every):
+                        metalearning_sampler = uniform_indices_generator(dataset_length - 1)
+
+                        import itertools
+                        for iteration in itertools.count(1):
+                            if finetuning_metalearn_every > 0:
+                                is_metalearning_iteration = iteration % finetuning_metalearn_every == 0
+                            elif finetuning_metalearn_every < 0:
+                                is_metalearning_iteration = iteration % -finetuning_metalearn_every != 0
+                            else:
+                                raise ValueError(
+                                    "finetuning_metalearn_every == 0 in " \
+                                    "alternating_indices_generator()")
+
+                            if is_metalearning_iteration:
+                                yield next(metalearning_sampler)
+                            else:
+                                yield dataset_length - 1
+
+                    return alternating_indices_generator(
+                        self.dataset_length, self.finetuning_metalearn_every)
 
         def worker_init(*args):
             import os
@@ -512,7 +544,7 @@ class Dataset(torch.utils.data.Dataset):
 
         return torch.utils.data.DataLoader(
             self, batch_size=1, num_workers=1,
-            sampler=InfiniteRandomSampler(len(self)),
+            sampler=InfiniteRandomSampler(len(self), self.finetuning_metalearn_every),
             collate_fn=lambda x: x[0], pin_memory=True,
             worker_init_fn=worker_init)
 

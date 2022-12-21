@@ -172,7 +172,28 @@ class Runner:
             if conf_path is not None:
                 update_config_tree(self.conf, ConfigFactory.parse_file(conf_path))
             if args.extra_config_args is not None:
-                update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
+                cmdline_config = ConfigFactory.parse_string(args.extra_config_args)
+                if cmdline_config.get_bool('train.finetuning_retain_old', default=False):
+                    new_scene = cmdline_config.get_list('dataset.data_dirs')
+                    assert len(new_scene) == 1
+                    self.conf['dataset']['data_dirs'] += new_scene
+                    del cmdline_config['dataset']['data_dirs']
+
+                    for suffix in '', '_val':
+                        original_num_scenes = len(self.conf['dataset.data_dirs']) - 1
+
+                        if not self.conf.get_list(f'dataset.images_to_pick{suffix}', default=None):
+                            self.conf['dataset'][f'images_to_pick{suffix}'] = \
+                                [[i, 'default'] for i in range(original_num_scenes)]
+
+                        if f'dataset.images_to_pick{suffix}' in cmdline_config:
+                            new_images_to_pick = cmdline_config[f'dataset.images_to_pick{suffix}']
+                            new_images_to_pick[0][0] = original_num_scenes
+
+                            self.conf['dataset'][f'images_to_pick{suffix}'] += new_images_to_pick
+                            del cmdline_config['dataset'][f'images_to_pick{suffix}']
+
+                update_config_tree(self.conf, cmdline_config)
 
         self.base_exp_dir = self.conf.get_string('general.base_exp_dir', default=None)
         assert self.base_exp_dir is not None, "'base_exp_dir' not defined anywhere"
@@ -259,15 +280,13 @@ class Runner:
         # 'pick' or 'average'
         finetuning_init_algorithm = \
             self.conf.get_string('train.finetuning_init_algorithm', default='average')
+        finetuning_retain_old = \
+            self.conf.get_bool('train.finetuning_retain_old', default=False)
 
         # For proper checkpoint auto-restarts
-        for key in 'load_optimizer', 'restart_from_iter', 'parts_to_skip_loading':
+        for key in 'load_optimizer', 'restart_from_iter', 'parts_to_skip_loading', 'finetuning_retain_old':
             if f'train.{key}' in self.conf:
                 del self.conf['train'][key]
-
-        if self.finetune:
-            assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
-            assert self.dataset_val.num_scenes == 1, "Can only finetune to one scene"
 
         # Loss weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
@@ -448,10 +467,10 @@ class Runner:
                 else:
                     scene_idx = None
 
-                self.sdf_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
-                self.color_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
-                self.deviation_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
-                self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm, scene_idx)
+                self.sdf_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx, finetuning_retain_old)
+                self.color_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx, finetuning_retain_old)
+                self.deviation_network.switch_to_finetuning(finetuning_init_algorithm, scene_idx, finetuning_retain_old)
+                self.nerf_outside.switch_to_finetuning(finetuning_init_algorithm, scene_idx, finetuning_retain_old)
 
         if not load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)
@@ -650,13 +669,16 @@ class Runner:
                 if self.use_white_bkgd:
                     background_rgb = torch.ones([1, 3])
 
+                render_background_nerf = not (self.finetune and scene_idx == self.dataset.num_scenes - 1)
+
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     render_out = self.renderer.render(
                         rays_o, rays_d, near, far, scene_idx,
                         background_rgb=background_rgb,
                         cos_anneal_ratio=self.get_cos_anneal_ratio(),
                         compute_eikonal_loss=self.igr_weight > 0,
-                        compute_radiance_grad_loss=self.radiance_grad_weight > 0)
+                        compute_radiance_grad_loss=self.radiance_grad_weight > 0,
+                        render_outside=render_background_nerf)
 
                     color_fine = render_out['color_fine']
                     s_val = render_out['s_val']
@@ -667,9 +689,12 @@ class Runner:
 
                     loss = 0
 
+                    use_mask_loss = \
+                        not (self.finetune and scene_idx != self.dataset.num_scenes - 1)
+
                     # Image loss: L1
                     target_rgb = true_rgb
-                    if self.mask_weight > 0.0:
+                    if self.mask_weight > 0.0 and use_mask_loss:
                         color_fine_loss = ((color_fine - target_rgb) * mask).abs().mean()
                     else:
                         target_rgb = true_rgb
@@ -679,7 +704,7 @@ class Runner:
                     psnr_train = psnr(color_fine, true_rgb, mask)
 
                     # Mask loss: BCE
-                    if self.mask_weight > 0.0:
+                    if self.mask_weight > 0.0 and use_mask_loss:
                         mask_loss = torch.nn.functional.binary_cross_entropy(
                             weight_sum.clip(1e-5, 1.0 - 1e-5), mask)
                         loss += mask_loss * self.mask_weight
@@ -809,6 +834,7 @@ class Runner:
 
                     if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                         self.validate_mesh(
+                            scene_idx=self.dataset.num_scenes - 1,
                             world_space=True,
                             resolution=512 if self.iter_step == self.end_iter else 64)
 
@@ -984,6 +1010,7 @@ class Runner:
                 for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
                     background_rgb = \
                             torch.ones([1, 3], device=rays_o.device) if self.use_white_bkgd else None
+                    render_background_nerf = not (self.finetune and val_scene_idx == self.dataset.num_scenes - 1)
 
                     render_out = self.renderer.render(rays_o_batch,
                                                       rays_d_batch,
@@ -993,7 +1020,8 @@ class Runner:
                                                       cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                                       background_rgb=background_rgb,
                                                       compute_eikonal_loss=False,
-                                                      compute_radiance_grad_loss=False)
+                                                      compute_radiance_grad_loss=False,
+                                                      render_outside=render_background_nerf)
 
                     def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
@@ -1101,6 +1129,8 @@ class Runner:
             background_rgb.copy_(background_color)
         background_rgb = background_rgb.to(self.device)
 
+        render_background_nerf = not (self.finetune and scene_idx == self.dataset.num_scenes - 1)
+
         tx = torch.linspace(0, w - 1, w)
         ty = torch.linspace(0, h - 1, h)
         pixels = torch.stack(torch.meshgrid(tx, ty, indexing='xy'), dim=-1) # h, w, 2
@@ -1163,7 +1193,8 @@ class Runner:
                                                           cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                                           background_rgb=background_rgb,
                                                           compute_eikonal_loss=False,
-                                                          compute_radiance_grad_loss=False)
+                                                          compute_radiance_grad_loss=False,
+                                                          render_outside=render_background_nerf)
 
                         rgb_all.append(render_out['color_fine'])
                         del render_out
@@ -1222,6 +1253,8 @@ class Runner:
         """
         Interpolate view between two cameras.
         """
+        render_background_nerf = not (self.finetune and scene_idx == self.dataset.num_scenes - 1)
+
         rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
             scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
 
@@ -1245,7 +1278,8 @@ class Runner:
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb,
                                               compute_eikonal_loss=False,
-                                              compute_radiance_grad_loss=False)
+                                              compute_radiance_grad_loss=False,
+                                              render_outside=render_background_nerf)
 
             rgb_all.append(render_out['color_fine'].detach().cpu().numpy())
 

@@ -12,6 +12,36 @@ class LowRankMultiLinear(nn.Module):
     """N linear layers whose weights are linearly regressed at forward pass from smaller
     matrices, leading to "lower rank" (lower DoF) parametrization.
     """
+    # A an application of PyTorch 'parametrization' functionality
+    class LowRankWeight(nn.Module):
+        def __init__(self, multi_linear_module, # type: LowRankMultiLinear
+            parameter_name: str, scene_idx: int):
+            super().__init__()
+
+            # don't "register as submodule", just store a reference
+            self.__dict__['multi_linear_module'] = multi_linear_module
+
+            self.parameter_name = parameter_name
+            self.scene_idx = scene_idx
+
+        def right_inverse(self, *args):
+            """By returning an empty tuple, this tells `register_parametrization()` that
+            we'll never need any of the original `Linear`'s parameters ('weight', 'bias').
+            """
+            return ()
+
+        def forward(self):
+            """No input args (module's parameters to be 'reparametrized') because we source
+            parameters only from external tensors (namely, from `self.multi_linear_module`).
+            This is ensured by `right_inverse()` having empty output.
+            """
+            param = self.multi_linear_module.get_parameter(self.parameter_name, self.scene_idx)
+
+            if self.parameter_name == 'weight' and self.multi_linear_module.use_weight_norm:
+                param = torch._weight_norm(param, self.multi_linear_module.weight_norm_g, 0)
+
+            return param
+
     def __init__(self, n_scenes, in_dim, out_dim, rank, weight_norm=False, use_bias=False):
         """
         rank:
@@ -35,7 +65,7 @@ class LowRankMultiLinear(nn.Module):
             [nn.Parameter(torch.empty(rank)) for _ in range(n_scenes)]) # n_scenes x rank
 
         self.reset_parameters_()
-        self.finetuning = False
+        # self.finetuning = False
 
         if self.use_weight_norm:
             with torch.no_grad():
@@ -46,40 +76,11 @@ class LowRankMultiLinear(nn.Module):
                 self.weight_norm_g = torch.nn.Parameter(
                     torch.norm_except_dim(weight, 2, dim=0))
 
-        # A an application of PyTorch 'parametrization' functionality
-        class LowRankWeight(nn.Module):
-            def __init__(self,
-                multi_linear_module: LowRankMultiLinear, parameter_name: str, scene_idx: int):
-                super().__init__()
-
-                # don't "register as submodule", just store a reference
-                self.__dict__['multi_linear_module'] = multi_linear_module
-
-                self.parameter_name = parameter_name
-                self.scene_idx = scene_idx
-
-            def right_inverse(self, *args):
-                """By returning an empty tuple, this tells `register_parametrization()` that
-                we'll never need any of the original `Linear`'s parameters ('weight', 'bias').
-                """
-                return ()
-
-            def forward(self):
-                """No input args (module's parameters to be 'reparametrized') because we source
-                parameters only from external tensors (namely, from `self.multi_linear_module`).
-                This is ensured by `right_inverse()` having empty output.
-                """
-                param = self.multi_linear_module.get_parameter(self.parameter_name, self.scene_idx)
-
-                if self.parameter_name == 'weight' and self.multi_linear_module.use_weight_norm:
-                    param = torch._weight_norm(param, self.multi_linear_module.weight_norm_g, 0)
-
-                return param
-
         for parameter_name, _ in list(self.linear_layers[0].named_parameters()):
             for scene_idx, layer in enumerate(self.linear_layers):
                 nn.utils.parametrize.register_parametrization(
-                    layer, parameter_name, LowRankWeight(self, parameter_name, scene_idx))
+                    layer, parameter_name,
+                    LowRankMultiLinear.LowRankWeight(self, parameter_name, scene_idx))
 
     def get_parameter(self, parameter_name, scene_idx):
         """
@@ -125,15 +126,20 @@ class LowRankMultiLinear(nn.Module):
         for x in self.combination_coeffs:
             nn.init.kaiming_uniform_(x[None], nonlinearity='linear')
 
-    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0, retain_old=False):
         """
         Like `SDFNetwork.switch_to_finetuning()`, but just for this layer.
 
         algorithm
             str
             One of:
-            - pick (take the 0th scene's linear combination coefficients)
+            - pick (take the `scene_idx`th scene's linear combination coefficients)
             - average (average coefficients over all scenes)
+        scene_idx
+            int
+        retain_old
+            bool
+            If True, append the new scene instead of replacing the old ones.
         """
         if algorithm == 'pick':
             if scene_idx == -1:
@@ -145,15 +151,27 @@ class LowRankMultiLinear(nn.Module):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-        self.combination_coeffs = nn.ParameterList([nn.Parameter(new_combination_coeffs)])
-        self.linear_layers = self.linear_layers[:1]
-        self.finetuning = True
+        if retain_old:
+            self.combination_coeffs.append(nn.Parameter(new_combination_coeffs))
+            new_layer = nn.Linear(
+                self.linear_layers[0].in_features,
+                self.linear_layers[0].out_features).to(new_combination_coeffs)
+            new_scene_idx = len(self.linear_layers)
+            for parameter_name in ('weight', 'bias'):
+                nn.utils.parametrize.register_parametrization(
+                        new_layer, parameter_name,
+                        LowRankMultiLinear.LowRankWeight(self, parameter_name, new_scene_idx))
+            self.linear_layers.append(new_layer)
+        else:
+            self.combination_coeffs = nn.ParameterList([nn.Parameter(new_combination_coeffs)])
+            self.linear_layers = self.linear_layers[:1]
+            # self.finetuning = True
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        if self.finetuning:
-            assert scene_idx is None or scene_idx == 0 and len(self.combination_coeffs) == 1
+        # if self.finetuning:
+        #     assert scene_idx is None or scene_idx == 0 and len(self.combination_coeffs) == 1
 
         if which_layers == 'all':
             return super().parameters()
@@ -185,6 +203,7 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
+                 layer_norm='dummy',
                  inside_outside=False):
         """
         n_scenes
@@ -381,7 +400,7 @@ class SDFNetwork(nn.Module):
                 only_inputs=True)[0]
             return gradients, sdf, feature_vector
 
-    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0, retain_old=False):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -389,13 +408,20 @@ class SDFNetwork(nn.Module):
         algorithm
             str
             One of:
-            - pick (take the `scene_idx`-th scene's 'subnetwork')
-            - average (average weight tensors over all scenes)
+            - pick (take the `scene_idx`th scene's linear combination coefficients)
+            - average (average coefficients over all scenes)
+        scene_idx
+            int
+        retain_old
+            bool
+            If True, append the new scene instead of replacing the old ones.
         """
         for i in range(self.num_layers):
             layer_type = type(self.linear_layers[i])
 
             if layer_type is nn.ModuleList:
+                if retain_old:
+                    raise NotImplementedError
                 if algorithm == 'pick':
                     new_layer = self.linear_layers[i][scene_idx]
                 elif algorithm == 'average':
@@ -410,7 +436,7 @@ class SDFNetwork(nn.Module):
                 self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
-                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx)
+                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx, retain_old)
 
     def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
@@ -464,6 +490,7 @@ class RenderingNetwork(nn.Module):
                  scenewise_core_rank=None,
                  scenewise_bias=False,
                  weight_norm=True,
+                 layer_norm='dummy',
                  multires=0,
                  multires_view=0,
                  squeeze_out=True):
@@ -618,7 +645,7 @@ class RenderingNetwork(nn.Module):
             # dim 2: gradient over x/y/z
             return torch.stack(gradients) # 3, K, 3
 
-    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0, retain_old=False):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -626,13 +653,20 @@ class RenderingNetwork(nn.Module):
         algorithm
             str
             One of:
-            - pick (take the `scene_idx`-th scene's 'subnetwork')
-            - average (average weight tensors over all scenes)
+            - pick (take the `scene_idx`th scene's linear combination coefficients)
+            - average (average coefficients over all scenes)
+        scene_idx
+            int
+        retain_old
+            bool
+            If True, append the new scene instead of replacing the old ones.
         """
         for i in range(self.num_layers):
             layer_type = type(self.linear_layers[i])
 
             if layer_type is nn.ModuleList:
+                if retain_old:
+                    raise NotImplementedError
                 if algorithm == 'pick':
                     new_layer = self.linear_layers[i][scene_idx]
                 elif algorithm == 'average':
@@ -647,7 +681,7 @@ class RenderingNetwork(nn.Module):
                 self.linear_layers[i] = nn.ModuleList([new_layer])
 
             elif layer_type is LowRankMultiLinear:
-                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx)
+                self.linear_layers[i].switch_to_finetuning(algorithm, scene_idx, retain_old)
 
                 # If we wanted to compute weights and revert to a regular `Linear` layer:
                 # if type(self.linear_layers[i]) is LowRankMultiLinear:
@@ -776,7 +810,7 @@ class MultiSceneNeRF(nn.ModuleList):
     def __init__(self, n_scenes, *args, **kwargs):
         super().__init__([NeRF(*args, **kwargs) for _ in range(n_scenes)])
 
-    def switch_to_finetuning(self, algorithm='pick', scene_idx=0):
+    def switch_to_finetuning(self, algorithm='pick', scene_idx=0, retain_old=False):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
@@ -786,11 +820,18 @@ class MultiSceneNeRF(nn.ModuleList):
             One of:
             - pick (take the `scene_idx`-th scene's 'subnetwork')
             - average (same as 'pick' because we don't use background in finetuning anyway)
-
-            Arguments have no effect: always works like it's algorithm=='pick' and scene_idx==0.
+        scene_idx
+            int
+            No effect
+        retain_old
+            bool
+            If True, append the new scene instead of replacing the old ones.
         """
         if algorithm in ('pick', 'average'):
-            super().__init__([self[0]])
+            if retain_old:
+                self.append(self[0])
+            else:
+                super().__init__([self[0]])
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
@@ -835,7 +876,7 @@ class SingleVarianceNetwork(nn.Module):
         with torch.no_grad():
             self.variance.fill_(init_val)
 
-    def switch_to_finetuning(self, algorithm=None, scene_idx=None):
+    def switch_to_finetuning(self, algorithm=None, scene_idx=None, retain_old=None):
         """
         Switch the network trained on multiple scenes to the 'finetuning mode',
         to finetune it to some new (one) scene.
