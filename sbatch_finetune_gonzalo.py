@@ -27,13 +27,11 @@ if __name__ == '__main__':
         ("130/2021-07-22-11-55-13", ["00552", "00460", "01072"], ["00490", "00749"]), # Ренат
         ("149/2021-07-28-20-34-57", ["00958", "00721", "00812"], ["00686", "01070"]), # мужик в серой майке
     ]
+    MODEL_NAME = "100_indep_splitReplFirstHalf_lr2.5e4_WNNB"
+    NUM_SCENES = 103
+    VANILLA_NEUS = False
 
-    # MODEL_NAME = "100_rank50_splitReplFirstHalf_720k_noBkgdBugFix_ann100k"
-    # MODEL_NAME = "100_rank150_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr3.5e4"
-    # MODEL_NAME = "100_rank400_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr2.5e4"
-    MODEL_NAME = "100_rank1000_splitReplFirstHalf_720k_noBkgdBugFix_ann100k_lr1.8e4"
-
-    port = 28300
+    port = 28305
 
     for scene, train_images, val_images in SCENES:
         dataset_dir = DATASET_ROOT / scene / "portrait_reconstruction"
@@ -43,15 +41,17 @@ if __name__ == '__main__':
             current_train_images = train_images[view_idxs]
 
             experiment_name = f"{MODEL_NAME}_ftTo{scene[:3]}-{view_name}"
-            exp_dir = pathlib.Path(f"./logs-paper/gonzalo/{MODEL_NAME}_camFt_lowCamLR/{view_name}-{len(current_train_images)}/{scene[:3]}")
+            experiment_subpath = f"{MODEL_NAME}_pick0/{view_name}-{len(current_train_images)}/{scene[:3]}"
+
+            exp_dir = pathlib.Path(f"./logs-paper-tmp/gonzalo") / experiment_subpath
             if exp_dir.is_dir():
                 print(f"Already exists, skipping: {exp_dir}")
                 port += 1
                 continue
             exp_dir.mkdir(exist_ok=True, parents=True)
 
-            cameras_exp_dir = pathlib.Path(f"./logs-paper/gonzalo_val-cameras-opt/{MODEL_NAME}_camFt_lowCamLR/{view_name}-{len(current_train_images)}/{scene[:3]}")
-            for iteration in '18000', '38000':
+            cameras_exp_dir = pathlib.Path(f"./logs-paper/gonzalo_val-cameras-opt") / experiment_subpath
+            for iteration in ('18000',) * (not VANILLA_NEUS) + ('38000',):
                 (cameras_exp_dir / iteration).mkdir(exist_ok=True, parents=True)
 
             script = \
@@ -61,14 +61,12 @@ f"""#!/bin/bash
 
 #SBATCH --job-name {experiment_name}
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 3:0:0
+#SBATCH --time 2:0:0
 
 #SBATCH -p gpu_a100,htc,gpu #,gpu_devel
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 13G
-
-##SBATCH --reservation egor.burkov_80
 
 set -e
 
@@ -84,23 +82,76 @@ NPROC=1
 
 # ======= Fit and fine-tune the model =======
 
+"""
+            if VANILLA_NEUS:
+                script += \
+f"""
+# Using "if" to prevent bash from seeing read's exit code (1) and triggering "set -e"
+if read -r -d '' EXTRA_ARGS; then :; fi << EndOfText
+general {{
+    base_exp_dir = {exp_dir}
+}}
+dataset {{
+    original_num_scenes = 1
+    data_dirs = ["{dataset_dir}"]
+    images_to_pick = [[0, [{', '.join(map(quoted, current_train_images))}]]]
+    images_to_pick_val = [[0, [{', '.join(map(quoted, val_images))}]]]
+    batch_size = 512
+}}
+train {{
+    batch_size = \\${{dataset.batch_size}}
+    cameras_optimizer_extra_args {{
+        base_learning_rate = 2.5e-5
+    }}
+    end_iter = 30000
+    learning_rate = 0.0 //3e-5
+    learning_rate_alpha = 0.1
+    learning_rate_reduce_steps = [20000]
+    warm_up_end = 1000
+
+    scenewise_layers_optimizer_extra_args {{
+        // This is for 'low-rank' layers and means "don't train linear combination coefficients"
+        // base_learning_rate = 0.0
+
+        // When using 'independent' layers, change to this instead:
+        base_learning_rate = 3e-5 //\\${{train.learning_rate}}
+    }}
+}}
+EndOfText
+
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path ./logs-new/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
---conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, [{', '.join(map(quoted, current_train_images))}]]], images_to_pick_val = [[0, [{', '.join(map(quoted, val_images))}]]], batch_size = 512 }}, train {{ batch_size = ${{dataset.batch_size}}, cameras_optimizer_extra_args {{ base_learning_rate = 2.5e-5 }} }}'
+--conf $CONF1 --extra_config_args "${{EXTRA_ARGS}}"
+"""
+            else: # not VANILLA_NEUS
+                script += \
+f"""
+torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
+--checkpoint_path ./logs-new/{MODEL_NAME}/checkpoints/$LATEST_CKPT \
+--conf $CONF1 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, dataset {{ original_num_scenes = {NUM_SCENES}, data_dirs = ["{dataset_dir}"], images_to_pick = [[0, [{', '.join(map(quoted, current_train_images))}]]], images_to_pick_val = [[0, [{', '.join(map(quoted, val_images))}]]], batch_size = 512 }}, train {{ batch_size = ${{dataset.batch_size}} }}'
 
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
---conf $CONF2 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}, train {{ cameras_optimizer_extra_args {{ base_learning_rate = 2.5e-5 }} }}'
+--conf $CONF2 --extra_config_args 'general {{ base_exp_dir = {exp_dir} }}'
+"""
 
-# ======= Optimize val cameras to measure PSNR =======
-
+            # ======= Optimize val cameras to measure PSNR =======
+            script += \
+f"""
 CONF3=`mktemp`
 cp confs/gonzalo_optimize_val_cameras.conf $CONF3
+"""
+            if not VANILLA_NEUS:
+                script += \
+f"""
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path {exp_dir}/checkpoints/ckpt_0018000.pth \
 --conf $CONF3 --extra_config_args 'general {{ base_exp_dir = {cameras_exp_dir}/18000 }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, [{', '.join(map(quoted, val_images))}]]], images_to_pick_val = [[0, [{', '.join(map(quoted, val_images))}]]], batch_size = 512 }}, train {{ restart_from_iter = 0, batch_size = ${{dataset.batch_size}} }}'
 rm {cameras_exp_dir}/18000/checkpoints/*
 rm {cameras_exp_dir}/18000/meshes/*
+"""
 
+            script += \
+f"""
 torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
 --checkpoint_path {exp_dir}/checkpoints/ckpt_0038000.pth \
 --conf $CONF3 --extra_config_args 'general {{ base_exp_dir = {cameras_exp_dir}/38000 }}, dataset {{ data_dirs = ["{dataset_dir}"], images_to_pick = [[0, [{', '.join(map(quoted, val_images))}]]], images_to_pick_val = [[0, [{', '.join(map(quoted, val_images))}]]], batch_size = 512 }}, train {{ restart_from_iter = 0, batch_size = ${{dataset.batch_size}} }}'

@@ -218,10 +218,12 @@ class SDFNetwork(nn.Module):
             n_layers += num_scene_specific_layers
         elif scenewise_split_type in ('replace_last_half', 'replace_first_half', 'replace_first_half_sdf_only'):
             num_scene_specific_layers = (n_layers + 1) // 2
-        elif scenewise_split_type in ('replace_first_3',):
+        elif scenewise_split_type in ('replace_first_3', 'replace_first_3_sdf_only'):
             num_scene_specific_layers = 3
-        elif scenewise_split_type in ('replace_first_2',):
+        elif scenewise_split_type in ('replace_first_2', 'replace_first_2_sdf_only'):
             num_scene_specific_layers = 2
+        elif scenewise_split_type in ('replace_first_1', 'replace_first_1_sdf_only'):
+            num_scene_specific_layers = 1
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
@@ -255,7 +257,7 @@ class SDFNetwork(nn.Module):
                 layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = self.num_layers - num_scene_specific_layers <= l < self.num_layers - 1
-            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_sdf_only', 'replace_first_2', 'replace_first_3'):
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_sdf_only', 'replace_first_1', 'replace_first_2', 'replace_first_3', 'replace_first_1_sdf_only', 'replace_first_2_sdf_only', 'replace_first_3_sdf_only'):
                 layer_is_scene_specific = l < num_scene_specific_layers
             elif scenewise_split_type in ('sdf_only', 'all'):
                 layer_is_scene_specific = l < self.num_layers - 1
@@ -476,8 +478,14 @@ class RenderingNetwork(nn.Module):
         if scenewise_split_type in ('append_half', 'prepend_half'):
             num_scene_specific_layers = (n_layers + 1) // 2
             n_layers += num_scene_specific_layers
-        elif scenewise_split_type in ('replace_last_half', 'replace_first_half', 'replace_first_half_radiance_only', 'replace_first_3', 'replace_first_2'):
+        elif scenewise_split_type in ('replace_last_half', 'replace_first_half', 'replace_first_half_radiance_only'):
             num_scene_specific_layers = (n_layers + 1) // 2
+        elif scenewise_split_type in ('replace_first_3',):
+            num_scene_specific_layers = 3
+        elif scenewise_split_type in ('replace_first_2',):
+            num_scene_specific_layers = 2
+        elif scenewise_split_type in ('replace_first_1',):
+            num_scene_specific_layers = 1
 
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
 
@@ -512,9 +520,9 @@ class RenderingNetwork(nn.Module):
                 layer_is_scene_specific = (self.num_layers - 1 - l) % 2 == 0
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
-            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_radiance_only', 'replace_first_2', 'replace_first_3'):
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half', 'replace_first_half_radiance_only', 'replace_first_1', 'replace_first_2', 'replace_first_3'):
                 layer_is_scene_specific = l < num_scene_specific_layers
-            elif scenewise_split_type in ('sdf_only', 'replace_first_half_sdf_only'):
+            elif scenewise_split_type in ('sdf_only', 'replace_first_half_sdf_only', 'replace_first_1_sdf_only', 'replace_first_2_sdf_only', 'replace_first_3_sdf_only'):
                 layer_is_scene_specific = False
             elif scenewise_split_type in ('radiance_only', 'all'):
                 layer_is_scene_specific = True
